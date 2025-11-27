@@ -4,7 +4,7 @@
 # Cloudflared 隧道管理脚本 (V4.3 - 终极全能修正版)
 # 功能：自动架构检测、配置管理、安全备份、UI美化、自动更新、版本对比
 # 新增：实时日志、配置备份、协议切换、端口健康检测、安全卸载
-# 修正：修复了更新源覆盖导致语法错误的问题
+# 修正：所有“返回”选项统一为 0
 # ==============================================================================
 
 # --- 全局变量与配置 ---
@@ -12,8 +12,7 @@ CONFIG_DIR="/etc/cloudflared"
 CONFIG_FILE="$CONFIG_DIR/config.yml"
 CRED_DIR="/root/.cloudflared"
 GH_PROXY="https://ghfast.top/" # GitHub 加速代理
-# 注意：为了防止误更新导致脚本损坏，已默认留空。如果您有自己的维护地址可填入。
-SCRIPT_URL="" 
+SCRIPT_URL="https://raw.githubusercontent.com/ioiy/hinas-cf/main/cf.sh" # 脚本更新地址
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -323,14 +322,14 @@ manage_domains() {
         echo ""
         echo "1. 添加新域名"
         echo "2. 删除域名"
-        echo "3. 返回主菜单"
+        echo "0. 返回主菜单"
         echo ""
         read -p "请选择: " dom_choice
 
         case $dom_choice in
             1) add_domain_logic ;;
             2) delete_domain_logic ;;
-            3) return ;;
+            0) return ;;
             *) msg_error "无效输入"; sleep 1 ;;
         esac
     done
@@ -431,7 +430,7 @@ service_status() {
     echo "2. 停止服务"
     echo "3. 重启服务"
     echo "4. 设置开机自启"
-    echo "5. 返回"
+    echo "0. 返回主菜单"
     
     read -p "请选择: " svc_opt
     case $svc_opt in
@@ -439,6 +438,7 @@ service_status() {
         2) systemctl stop cloudflared && msg_warn "已停止";;
         3) systemctl restart cloudflared && msg_success "已重启";;
         4) systemctl enable cloudflared && msg_success "已设置开机自启";;
+        0) return ;;
         *) return ;;
     esac
     pause
@@ -453,15 +453,15 @@ toolbox_menu() {
         echo "1. 查看实时日志 (Live Logs)"
         echo "2. 备份配置文件 (Backup Config)"
         echo "3. 切换传输协议 (QUIC/HTTP2)"
-        echo "4. 返回主菜单"
+        echo "0. 返回主菜单"
         echo ""
-        read -p "请选择 [1-4]: " t_choice
+        read -p "请选择 [1-3, 0]: " t_choice
         
         case $t_choice in
             1) view_logs ;;
             2) backup_config ;;
             3) switch_protocol ;;
-            4) return ;;
+            0) return ;;
             *) msg_error "无效选项"; sleep 1 ;;
         esac
     done
@@ -514,7 +514,7 @@ switch_protocol() {
     echo ""
     echo "1. 切换为 http2 (推荐网络不佳时使用)"
     echo "2. 恢复为 QUIC (默认)"
-    echo "3. 返回"
+    echo "0. 返回上一级"
     
     read -p "请选择: " p_choice
     
@@ -539,7 +539,7 @@ switch_protocol() {
                 msg_info "已经是 QUIC 协议了。"
             fi
             ;;
-        3) return ;;
+        0) return ;;
     esac
     pause
 }
