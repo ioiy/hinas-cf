@@ -1,10 +1,9 @@
 #!/bin/bash
 
 # ==============================================================================
-# Cloudflared 隧道管理脚本 (V4.3 - 终极全能修正版)
+# Cloudflared 隧道管理脚本 (V4.4 - 终极全能修正版)
 # 功能：自动架构检测、配置管理、安全备份、UI美化、自动更新、版本对比
-# 新增：实时日志、配置备份、协议切换、端口健康检测、安全卸载
-# 修正：所有“返回”选项统一为 0
+# 新增：Token模式支持、智能备份清理、进程资源监控
 # ==============================================================================
 
 # --- 全局变量与配置 ---
@@ -33,7 +32,7 @@ print_logo() {
     clear
     local current_ver=$(get_script_version "$0")
     echo -e "${BLUE}=============================================================${PLAIN}"
-    echo -e "${CYAN}    Cloudflared Tunnel Manager ${YELLOW}($current_ver Fixed)${PLAIN}"
+    echo -e "${CYAN}    Cloudflared Tunnel Manager ${YELLOW}($current_ver Ultimate)${PLAIN}"
     echo -e "${BLUE}=============================================================${PLAIN}"
     echo -e "  ${PLAIN}专注于管理本机隧道配置、域名路由与服务状态"
     echo -e "  ${PLAIN}当前架构: ${YELLOW}$(uname -m)${PLAIN} | 配置文件: ${YELLOW}$CONFIG_FILE${PLAIN}"
@@ -422,7 +421,24 @@ delete_domain_logic() {
 service_status() {
     print_logo
     echo -e "${CYAN}=== 系统服务状态 ===${PLAIN}"
-    echo ""
+    
+    # --- 资源监控 ---
+    if pgrep cloudflared > /dev/null; then
+        local pid=$(pgrep cloudflared | head -n 1)
+        # 获取 CPU, MEM, TIME
+        local stats=$(ps -p $pid -o %cpu,%mem,etime --no-headers)
+        local cpu=$(echo $stats | awk '{print $1}')
+        local mem=$(echo $stats | awk '{print $2}')
+        local time=$(echo $stats | awk '{print $3}')
+        
+        echo -e "运行状态: ${GREEN}● 正在运行${PLAIN} (PID: $pid)"
+        echo -e "资源占用: CPU: ${YELLOW}${cpu}%${PLAIN} | 内存: ${YELLOW}${mem}%${PLAIN} | 运行时长: ${CYAN}${time}${PLAIN}"
+    else
+        echo -e "运行状态: ${RED}● 未运行${PLAIN}"
+    fi
+    echo -e "-------------------------------------------------------------"
+    # ----------------
+    
     systemctl status cloudflared --no-pager
     echo ""
     echo -e "${BLUE}操作选项:${PLAIN}"
@@ -453,14 +469,16 @@ toolbox_menu() {
         echo "1. 查看实时日志 (Live Logs)"
         echo "2. 备份配置文件 (Backup Config)"
         echo "3. 切换传输协议 (QUIC/HTTP2)"
+        echo "4. 清理冗余备份 (保留最新5份)"
         echo "0. 返回主菜单"
         echo ""
-        read -p "请选择 [1-3, 0]: " t_choice
+        read -p "请选择 [1-4, 0]: " t_choice
         
         case $t_choice in
             1) view_logs ;;
             2) backup_config ;;
             3) switch_protocol ;;
+            4) clean_backups ;;
             0) return ;;
             *) msg_error "无效选项"; sleep 1 ;;
         esac
@@ -495,6 +513,26 @@ backup_config() {
     else
         msg_error "备份失败。"
     fi
+    pause
+}
+
+clean_backups() {
+    print_logo
+    msg_info "正在扫描旧的配置文件备份..."
+    local BACKUP_COUNT=$(ls $CONFIG_FILE.bak.* 2>/dev/null | wc -l)
+    
+    if [ "$BACKUP_COUNT" -le 5 ]; then
+        msg_info "备份文件数量 ($BACKUP_COUNT) 很少，无需清理。"
+        pause
+        return
+    fi
+    
+    msg_info "发现 $BACKUP_COUNT 个备份文件，正在清理旧文件..."
+    
+    # 列出所有备份文件，按时间排序(最旧在前)，保留最后5个，其他的删除
+    ls -rt $CONFIG_FILE.bak.* | head -n -5 | xargs rm -f
+    
+    msg_success "清理完成！现在只保留了最新的 5 份备份。"
     pause
 }
 
@@ -544,6 +582,41 @@ switch_protocol() {
     pause
 }
 
+install_token_mode() {
+    print_logo
+    echo -e "${CYAN}=== Token 模式安装 (Web Dashboard) ===${PLAIN}"
+    echo -e "${YELLOW}注意：${PLAIN}此模式下，隧道路由完全由 Cloudflare 网页后台管理。"
+    echo -e "本地的 config.yml 将失效，脚本的[管理域名]功能也将无法使用。"
+    echo ""
+    read -p "请输入 Cloudflare 提供的 Token (以 eyJh 开头的长串): " TOKEN
+    
+    if [ -z "$TOKEN" ]; then
+        msg_error "Token 不能为空。"
+        pause; return
+    fi
+    
+    echo ""
+    msg_info "正在停止当前服务..."
+    systemctl stop cloudflared
+    
+    if [ -f "$CONFIG_FILE" ]; then
+        msg_info "备份旧配置文件..."
+        mv "$CONFIG_FILE" "${CONFIG_FILE}.bak.token_install"
+    fi
+    
+    msg_info "正在安装 Token 服务..."
+    cloudflared service install "$TOKEN"
+    
+    if [ $? -ne 0 ]; then
+        msg_error "安装失败，请检查 Token 是否正确。"
+        pause; return
+    fi
+    
+    msg_success "Token 服务安装成功！"
+    echo -e "请前往 Cloudflare Zero Trust Dashboard 查看连接状态。"
+    pause
+}
+
 uninstall_cloudflared() {
     print_logo
     echo -e "${RED}========================================${PLAIN}"
@@ -590,7 +663,7 @@ update_script() {
     
     if [[ -z "$SCRIPT_URL" ]]; then
         msg_warn "未配置更新源 (SCRIPT_URL)。"
-        echo "为了防止覆盖您当前定制的 V4.3 版本，自动更新功能已暂停。"
+        echo "为了防止覆盖您当前定制的 V4.4 版本，自动更新功能已暂停。"
         echo "如果您有自己的脚本维护地址，请编辑脚本修改 SCRIPT_URL 变量。"
         pause
         return
@@ -675,11 +748,12 @@ while true; do
     echo -e "7. ${YELLOW}更新此脚本${PLAIN}"
     echo -e "8. ${BLUE}高级工具箱 (日志/备份/协议)${PLAIN}"
     echo -e "9. ${RED}彻底卸载 Cloudflared${PLAIN}"
+    echo -e "10. ${CYAN}Token 模式安装 (网页端管理)${PLAIN}"
     echo -e "0. 退出"
     echo ""
-    read -p "请输入选项 [0-9]: " choice
+    read -p "请输入选项 [0-10]: " choice
 
-    case $choice in
+    case $choice 在
         1) install_cloudflared ;;
         2) login_cloudflare ;;
         3) create_tunnel_wizard ;;
@@ -693,6 +767,7 @@ while true; do
         7) update_script ;;
         8) toolbox_menu ;;
         9) uninstall_cloudflared ;;
+        10) install_token_mode ;;
         0) exit 0 ;;
         *) msg_error "无效选项"; sleep 1 ;;
     esac
