@@ -116,12 +116,16 @@ install_cloudflared() {
 
     if [[ "$LOCAL_VER" == "$REMOTE_VER" && "$LOCAL_VER" != "未安装" ]]; then
         echo -e "${GREEN}当前已是最新版本。${PLAIN}"
-        read -p "是否强制重新安装? (y/N): " choice
+        echo -e "1. 强制重新安装"
     else
-        read -p "是否开始安装/更新? (y/N): " choice
+        echo -e "1. 立即更新/安装"
     fi
+    echo -e "0. 返回上一级"
+    echo ""
+    
+    read -p "请选择 [1/0]: " choice
 
-    if [[ ! "$choice" =~ ^[yY]$ ]]; then
+    if [[ "$choice" != "1" ]]; then
         msg_info "操作已取消。"
         pause
         return
@@ -510,12 +514,17 @@ update_script() {
     echo ""
 
     if [[ "$CURRENT_SCRIPT_VER" == "$REMOTE_SCRIPT_VER" ]]; then
-        read -p "版本已是最新，是否强制覆盖? (y/N): " choice
+        echo -e "${GREEN}当前已是最新版本。${PLAIN}"
+        echo -e "1. 强制覆盖更新"
     else
-        read -p "发现新版本，是否更新? (y/N): " choice
+        echo -e "1. 立即更新"
     fi
+    echo -e "0. 返回上一级"
+    echo ""
+    
+    read -p "请选择 [1/0]: " choice
 
-    if [[ ! "$choice" =~ ^[yY]$ ]]; then
+    if [[ "$choice" != "1" ]]; then
         msg_info "更新已取消。"
         rm -f "$TEMP_FILE"
         pause
