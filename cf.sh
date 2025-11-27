@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==============================================================================
-# Cloudflared 隧道管理脚本 (V4 - 终极美化增强版)
-# 功能：自动架构检测、配置管理、安全备份、UI美化
+# Cloudflared 隧道管理脚本 (V4.1 - 终极美化增强版)
+# 功能：自动架构检测、配置管理、安全备份、UI美化、自动更新
 # ==============================================================================
 
 # --- 全局变量与配置 ---
@@ -10,6 +10,7 @@ CONFIG_DIR="/etc/cloudflared"
 CONFIG_FILE="$CONFIG_DIR/config.yml"
 CRED_DIR="/root/.cloudflared"
 GH_PROXY="https://ghfast.top/" # GitHub 加速代理，如果是国外机器可留空 ""
+SCRIPT_URL="https://raw.githubusercontent.com/ioiy/hinas-cf/main/cf.sh" # 脚本更新地址
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -24,7 +25,7 @@ PLAIN='\033[0m'
 print_logo() {
     clear
     echo -e "${BLUE}=============================================================${PLAIN}"
-    echo -e "${CYAN}    Cloudflared Tunnel Manager ${YELLOW}(V4.0 Enhanced)${PLAIN}"
+    echo -e "${CYAN}    Cloudflared Tunnel Manager ${YELLOW}(V4.1 Enhanced)${PLAIN}"
     echo -e "${BLUE}=============================================================${PLAIN}"
     echo -e "  ${PLAIN}专注于管理本机隧道配置、域名路由与服务状态"
     echo -e "  ${PLAIN}当前架构: ${YELLOW}$(uname -m)${PLAIN} | 配置文件: ${YELLOW}$CONFIG_FILE${PLAIN}"
@@ -424,6 +425,52 @@ service_status() {
     pause
 }
 
+update_script() {
+    print_logo
+    echo -e "${CYAN}=== 脚本自我更新 ===${PLAIN}"
+    msg_info "正在检查脚本更新..."
+    
+    local TEMP_FILE="/tmp/cf_manager_new.sh"
+    
+    # 尝试下载
+    local DOWNLOAD_URL="${SCRIPT_URL}"
+    # 如果配置了 GH_PROXY 且 SCRIPT_URL 是 github 链接，尝试拼接代理以便国内更新
+    if [[ -n "$GH_PROXY" && "$SCRIPT_URL" == *"github"* ]]; then
+        DOWNLOAD_URL="${GH_PROXY}${SCRIPT_URL}"
+    fi
+    
+    msg_info "正在从服务器下载最新版本..."
+    wget --no-check-certificate -O "$TEMP_FILE" "$DOWNLOAD_URL"
+    
+    if [ $? -ne 0 ]; then
+        msg_error "下载失败，请检查网络。"
+        rm -f "$TEMP_FILE"
+        pause
+        return
+    fi
+    
+    # 完整性检查 (防止下载到 404 页面或空文件)
+    if ! grep -q "Cloudflared Tunnel Manager" "$TEMP_FILE"; then
+        msg_error "下载的文件验证失败 (可能是网络问题或无效文件)。"
+        rm -f "$TEMP_FILE"
+        pause
+        return
+    fi
+
+    # 备份当前脚本
+    cp "$0" "${0}.bak"
+    msg_info "已备份当前脚本到 ${0}.bak"
+    
+    # 替换并赋予权限
+    mv "$TEMP_FILE" "$0"
+    chmod +x "$0"
+    
+    msg_success "脚本已更新！即将重新加载..."
+    sleep 2
+    # 重新执行当前脚本
+    exec "$0"
+}
+
 # --- 主逻辑 ---
 
 check_root
@@ -437,9 +484,10 @@ while true; do
     echo -e "4. ${CYAN}管理域名 (添加/删除 本地路由)${PLAIN} ${RED}[常用]${PLAIN}"
     echo -e "5. ${CYAN}服务管理 (启动/停止/日志)${PLAIN}"
     echo -e "6. 列出云端所有隧道"
+    echo -e "7. ${YELLOW}更新此脚本${PLAIN}"
     echo -e "0. 退出"
     echo ""
-    read -p "请输入选项 [0-6]: " choice
+    read -p "请输入选项 [0-7]: " choice
 
     case $choice in
         1) install_cloudflared ;;
@@ -452,22 +500,8 @@ while true; do
            cloudflared tunnel list
            pause
            ;;
+        7) update_script ;;
         0) exit 0 ;;
         *) msg_error "无效选项"; sleep 1 ;;
     esac
 done
-```
-
-### 脚本使用说明
-
-1.  **保存脚本：**
-    将上述代码保存为 `cf.sh`。
-
-2.  **赋予执行权限：**
-    ```bash
-    chmod +x cf.sh
-    ```
-
-3.  **运行脚本：**
-    ```bash
-    sudo ./cf.sh
