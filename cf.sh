@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # ==============================================================================
-# Cloudflared 隧道管理脚本 (V4.6 - 终极全能修正版 II)
+# Cloudflared 隧道管理脚本 (V4.7 - 终极全能修正版 III)
 # 功能：自动架构检测、配置管理、安全备份、UI美化、自动更新、版本对比
-# V4.6新增：定时重启任务、网络延迟检测、恢复更新源(带安全盾)
+# V4.7改进：升级备份清理功能为“备份管理器”，支持指定删除、批量清理
 # ==============================================================================
 
 # --- 全局变量与配置 ---
@@ -11,7 +11,6 @@ CONFIG_DIR="/etc/cloudflared"
 CONFIG_FILE="$CONFIG_DIR/config.yml"
 CRED_DIR="/root/.cloudflared"
 GH_PROXY="https://ghfast.top/" # GitHub 加速代理
-# 已恢复更新源，配合下方的语法检查机制，可安全使用
 SCRIPT_URL="https://raw.githubusercontent.com/ioiy/hinas-cf/main/cf.sh"
 
 # --- 颜色定义 ---
@@ -121,7 +120,7 @@ install_cloudflared() {
 
     # 1. 获取当前版本
     local LOCAL_VER="未安装"
-    if command -v cloudflared &> /dev/null; then
+    if command -v cloudflared &> /dev/null; 键，然后
         LOCAL_VER=$(cloudflared --version 2>/dev/null | awk '{print $3}' | sed 's/,//')
     fi
 
@@ -480,7 +479,7 @@ toolbox_menu() {
         echo "1. 查看实时日志 (Live Logs)"
         echo "2. 备份配置文件 (Backup Config)"
         echo "3. 切换传输协议 (QUIC/HTTP2)"
-        echo "4. 清理冗余备份 (保留最新5份)"
+        echo "4. 管理备份文件 (删除/清理)"
         echo "5. 网络延迟检测 (Ping Cloudflare)"
         echo "0. 返回主菜单"
         echo ""
@@ -490,7 +489,7 @@ toolbox_menu() {
             1) view_logs ;;
             2) backup_config ;;
             3) switch_protocol ;;
-            4) clean_backups ;;
+            4) manage_backups ;;
             5) network_test ;;
             0) return ;;
             *) msg_error "无效选项"; sleep 1 ;;
@@ -528,21 +527,71 @@ backup_config() {
     pause
 }
 
-clean_backups() {
-    print_logo
-    msg_info "正在扫描旧的配置文件备份..."
-    local BACKUP_COUNT=$(ls $CONFIG_FILE.bak.* 2>/dev/null | wc -l)
-    
-    if [ "$BACKUP_COUNT" -le 5 ]; then
-        msg_info "备份文件数量 ($BACKUP_COUNT) 很少，无需清理。"
-        pause
-        return
-    fi
-    
-    msg_info "发现 $BACKUP_COUNT 个备份文件，正在清理旧文件..."
-    ls -rt $CONFIG_FILE.bak.* | head -n -5 | xargs rm -f
-    msg_success "清理完成！现在只保留了最新的 5 份备份。"
-    pause
+manage_backups() {
+    while true; do
+        print_logo
+        echo -e "${CYAN}=== 备份文件管理 ===${PLAIN}"
+        
+        # 获取所有备份文件并按名称排序
+        local backups=($(ls $CONFIG_FILE.bak.* 2>/dev/null | sort))
+        
+        if [ ${#backups[@]} -eq 0 ]; then
+            echo "没有找到备份文件。"
+            echo ""
+            read -n 1 -s -r -p "按任意键返回..."
+            return
+        fi
+
+        echo -e "当前共有 ${#backups[@]} 个备份文件："
+        echo "----------------------------------------"
+        local i=1
+        for bk in "${backups[@]}"; do
+            echo -e " $i. $(basename "$bk")"
+            let i++
+        done
+        echo "----------------------------------------"
+        echo -e "输入 ${GREEN}数字序号${PLAIN} 删除指定文件"
+        echo -e "输入 ${YELLOW}k${PLAIN} 保留最近5份并删除其他"
+        echo -e "输入 ${RED}a${PLAIN} 删除所有备份"
+        echo -e "输入 ${BLUE}0${PLAIN} 返回上一级"
+        echo ""
+        
+        read -p "请输入操作: " op
+        
+        case $op 在
+            0) return ;;
+            k) 
+               if [ ${#backups[@]} -le 5 ]; then
+                   msg_warn "备份数量未超过 5 个，无需清理。"
+               else
+                   ls -rt $CONFIG_FILE.bak.* | head -n -5 | xargs rm -f
+                   msg_success "已清理旧备份，仅保留最新 5 份。"
+               fi
+               sleep 2
+               ;;
+            a)
+               read -p "确认删除所有备份? (y/N): " confirm
+               if [[ "$confirm" =~ ^[yY]$ ]]; then
+                   rm -f $CONFIG_FILE.bak.*
+                   msg_success "已清空所有备份。"
+                   sleep 2
+                   return
+               fi
+               ;;
+            *)
+               if [[ "$op" =~ ^[0-9]+$ ]] && [ "$op" -ge 1 ] && [ "$op" -le ${#backups[@]} ]; then
+                   local file_idx=$((op-1))
+                   local file_path="${backups[$file_idx]}"
+                   rm -f "$file_path"
+                   msg_success "已删除: $(basename "$file_path")"
+                   sleep 1
+               else
+                   msg_error "无效选项"
+                   sleep 1
+               fi
+               ;;
+        esac
+    done
 }
 
 switch_protocol() {
