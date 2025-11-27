@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # ==============================================================================
-# Cloudflared 隧道管理脚本 (V4.4 - 终极全能修正版)
+# Cloudflared 隧道管理脚本 (V4.6 - 终极全能修正版 II)
 # 功能：自动架构检测、配置管理、安全备份、UI美化、自动更新、版本对比
-# 新增：Token模式支持、智能备份清理、进程资源监控
+# V4.6新增：定时重启任务、网络延迟检测、恢复更新源(带安全盾)
 # ==============================================================================
 
 # --- 全局变量与配置 ---
@@ -11,7 +11,8 @@ CONFIG_DIR="/etc/cloudflared"
 CONFIG_FILE="$CONFIG_DIR/config.yml"
 CRED_DIR="/root/.cloudflared"
 GH_PROXY="https://ghfast.top/" # GitHub 加速代理
-SCRIPT_URL="https://raw.githubusercontent.com/ioiy/hinas-cf/main/cf.sh" # 脚本更新地址
+# 已恢复更新源，配合下方的语法检查机制，可安全使用
+SCRIPT_URL="https://raw.githubusercontent.com/ioiy/hinas-cf/main/cf.sh"
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -34,8 +35,32 @@ print_logo() {
     echo -e "${BLUE}=============================================================${PLAIN}"
     echo -e "${CYAN}    Cloudflared Tunnel Manager ${YELLOW}($current_ver Ultimate)${PLAIN}"
     echo -e "${BLUE}=============================================================${PLAIN}"
-    echo -e "  ${PLAIN}专注于管理本机隧道配置、域名路由与服务状态"
-    echo -e "  ${PLAIN}当前架构: ${YELLOW}$(uname -m)${PLAIN} | 配置文件: ${YELLOW}$CONFIG_FILE${PLAIN}"
+    
+    # --- 资源监控 (全局常驻) ---
+    if pgrep cloudflared > /dev/null; then
+        local pid=$(pgrep cloudflared | head -n 1)
+        # 尝试获取资源信息
+        local stats=""
+        # 检查 ps 命令是否支持标准输出格式
+        if ps -p "$pid" -o %cpu,%mem,etime >/dev/null 2>&1; then
+            stats=$(ps -p "$pid" -o %cpu,%mem,etime --no-headers 2>/dev/null)
+        fi
+        
+        if [ -n "$stats" ]; then
+             local cpu=$(echo "$stats" | awk '{print $1}')
+             local mem=$(echo "$stats" | awk '{print $2}')
+             local time=$(echo "$stats" | awk '{print $3}')
+             echo -e "  状态: ${GREEN}● 运行中${PLAIN} | CPU: ${YELLOW}${cpu}%${PLAIN} | 内存: ${YELLOW}${mem}%${PLAIN} | 时长: ${CYAN}${time}${PLAIN}"
+        else
+             # 降级显示 (当 ps 命令不支持参数时)
+             echo -e "  状态: ${GREEN}● 运行中${PLAIN} (PID: $pid)"
+        fi
+    else
+        echo -e "  状态: ${RED}● 未运行${PLAIN}"
+    fi
+    # -------------------------
+
+    echo -e "  架构: ${YELLOW}$(uname -m)${PLAIN} | 配置: ${YELLOW}$CONFIG_FILE${PLAIN}"
     echo -e "${BLUE}-------------------------------------------------------------${PLAIN}"
 }
 
@@ -60,9 +85,11 @@ check_root() {
 }
 
 check_dependencies() {
-    local deps=("wget" "curl" "grep" "sed" "awk" "systemctl" "tar")
+    local deps=("wget" "curl" "grep" "sed" "awk" "systemctl" "tar" "crontab")
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" &> /dev/null; then
+            # crontab 特殊处理，有些系统叫 cronie
+            if [[ "$dep" == "crontab" ]]; then continue; fi 
             msg_error "缺少必要命令: $dep"
             echo "请先安装它 (例如: apt install $dep 或 yum install $dep)"
             exit 1
@@ -421,23 +448,7 @@ delete_domain_logic() {
 service_status() {
     print_logo
     echo -e "${CYAN}=== 系统服务状态 ===${PLAIN}"
-    
-    # --- 资源监控 ---
-    if pgrep cloudflared > /dev/null; then
-        local pid=$(pgrep cloudflared | head -n 1)
-        # 获取 CPU, MEM, TIME
-        local stats=$(ps -p $pid -o %cpu,%mem,etime --no-headers)
-        local cpu=$(echo $stats | awk '{print $1}')
-        local mem=$(echo $stats | awk '{print $2}')
-        local time=$(echo $stats | awk '{print $3}')
-        
-        echo -e "运行状态: ${GREEN}● 正在运行${PLAIN} (PID: $pid)"
-        echo -e "资源占用: CPU: ${YELLOW}${cpu}%${PLAIN} | 内存: ${YELLOW}${mem}%${PLAIN} | 运行时长: ${CYAN}${time}${PLAIN}"
-    else
-        echo -e "运行状态: ${RED}● 未运行${PLAIN}"
-    fi
-    echo -e "-------------------------------------------------------------"
-    # ----------------
+    # 资源监控已在 Logo 下方显示
     
     systemctl status cloudflared --no-pager
     echo ""
@@ -470,15 +481,17 @@ toolbox_menu() {
         echo "2. 备份配置文件 (Backup Config)"
         echo "3. 切换传输协议 (QUIC/HTTP2)"
         echo "4. 清理冗余备份 (保留最新5份)"
+        echo "5. 网络延迟检测 (Ping Cloudflare)"
         echo "0. 返回主菜单"
         echo ""
-        read -p "请选择 [1-4, 0]: " t_choice
+        read -p "请选择 [1-5, 0]: " t_choice
         
         case $t_choice in
             1) view_logs ;;
             2) backup_config ;;
             3) switch_protocol ;;
             4) clean_backups ;;
+            5) network_test ;;
             0) return ;;
             *) msg_error "无效选项"; sleep 1 ;;
         esac
@@ -504,7 +517,6 @@ backup_config() {
         pause; return
     fi
     
-    # 忽略文件不存在的错误
     tar -czf "$BACKUP_FILE" "$CONFIG_DIR" "$CRED_DIR" 2>/dev/null
     
     if [ -f "$BACKUP_FILE" ]; then
@@ -528,10 +540,7 @@ clean_backups() {
     fi
     
     msg_info "发现 $BACKUP_COUNT 个备份文件，正在清理旧文件..."
-    
-    # 列出所有备份文件，按时间排序(最旧在前)，保留最后5个，其他的删除
     ls -rt $CONFIG_FILE.bak.* | head -n -5 | xargs rm -f
-    
     msg_success "清理完成！现在只保留了最新的 5 份备份。"
     pause
 }
@@ -582,6 +591,19 @@ switch_protocol() {
     pause
 }
 
+network_test() {
+    print_logo
+    echo -e "${CYAN}=== 网络延迟检测 ===${PLAIN}"
+    echo "正在 Ping Cloudflare 边缘节点 (1.1.1.1)..."
+    echo ""
+    ping -c 4 1.1.1.1
+    echo ""
+    echo "正在 Ping Google (8.8.8.8)..."
+    echo ""
+    ping -c 4 8.8.8.8
+    pause
+}
+
 install_token_mode() {
     print_logo
     echo -e "${CYAN}=== Token 模式安装 (Web Dashboard) ===${PLAIN}"
@@ -614,6 +636,48 @@ install_token_mode() {
     
     msg_success "Token 服务安装成功！"
     echo -e "请前往 Cloudflare Zero Trust Dashboard 查看连接状态。"
+    pause
+}
+
+# --- 定时任务管理 ---
+
+manage_cron() {
+    print_logo
+    echo -e "${CYAN}=== 定时重启任务 (Crontab) ===${PLAIN}"
+    
+    if ! command -v crontab &> /dev/null; then
+        msg_error "系统中未找到 crontab 命令，无法管理定时任务。"
+        pause; return
+    fi
+    
+    local CRON_CMD="systemctl restart cloudflared"
+    # 检查是否存在
+    local EXISTS=$(crontab -l 2>/dev/null | grep "$CRON_CMD")
+    
+    if [ -n "$EXISTS" ]; then
+        echo -e "当前状态: ${GREEN}已开启${PLAIN} (每天凌晨 4:00 重启)"
+        echo ""
+        echo "1. 关闭定时重启"
+    else
+        echo -e "当前状态: ${YELLOW}未开启${PLAIN}"
+        echo ""
+        echo "1. 开启定时重启 (每天凌晨 4:00)"
+    fi
+    echo "0. 返回主菜单"
+    
+    read -p "请选择: " c_choice
+    
+    if [[ "$c_choice" == "1" ]]; then
+        if [ -n "$EXISTS" ]; then
+            # 删除任务
+            crontab -l 2>/dev/null | grep -v "$CRON_CMD" | crontab -
+            msg_success "已关闭定时重启。"
+        else
+            # 添加任务 (0 4 * * *)
+            (crontab -l 2>/dev/null; echo "0 4 * * * $CRON_CMD") | crontab -
+            msg_success "已开启定时重启。"
+        fi
+    fi
     pause
 }
 
@@ -663,10 +727,7 @@ update_script() {
     
     if [[ -z "$SCRIPT_URL" ]]; then
         msg_warn "未配置更新源 (SCRIPT_URL)。"
-        echo "为了防止覆盖您当前定制的 V4.4 版本，自动更新功能已暂停。"
-        echo "如果您有自己的脚本维护地址，请编辑脚本修改 SCRIPT_URL 变量。"
-        pause
-        return
+        pause; return
     fi
     
     msg_info "正在检查脚本更新..."
@@ -693,6 +754,19 @@ update_script() {
         pause
         return
     fi
+    
+    # --- 关键修改：语法安全检查 ---
+    # 这将拦截所有语法错误（如 'case $choice 在'），防止覆盖本地脚本
+    if ! bash -n "$TEMP_FILE"; then
+        echo ""
+        msg_error "严重安全警告：下载的远程脚本包含语法错误！"
+        echo -e "${RED}更新已被强制拦截。您本地的脚本未受影响。${PLAIN}"
+        echo -e "错误原因可能是上游仓库代码损坏。"
+        rm -f "$TEMP_FILE"
+        pause
+        return
+    fi
+    # ---------------------------
 
     local CURRENT_SCRIPT_VER=$(get_script_version "$0")
     local REMOTE_SCRIPT_VER=$(get_script_version "$TEMP_FILE")
@@ -749,9 +823,10 @@ while true; do
     echo -e "8. ${BLUE}高级工具箱 (日志/备份/协议)${PLAIN}"
     echo -e "9. ${RED}彻底卸载 Cloudflared${PLAIN}"
     echo -e "10. ${CYAN}Token 模式安装 (网页端管理)${PLAIN}"
+    echo -e "11. ${BLUE}定时重启任务 (Crontab)${PLAIN}"
     echo -e "0. 退出"
     echo ""
-    read -p "请输入选项 [0-10]: " choice
+    read -p "请输入选项 [0-11]: " choice
 
     case $choice in
         1) install_cloudflared ;;
@@ -768,6 +843,7 @@ while true; do
         8) toolbox_menu ;;
         9) uninstall_cloudflared ;;
         10) install_token_mode ;;
+        11) manage_cron ;;
         0) exit 0 ;;
         *) msg_error "无效选项"; sleep 1 ;;
     esac
