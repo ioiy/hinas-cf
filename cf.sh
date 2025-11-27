@@ -1,17 +1,19 @@
 #!/bin/bash
 
 # ==============================================================================
-# Cloudflared 隧道管理脚本 (V4.3 - 终极全能版)
+# Cloudflared 隧道管理脚本 (V4.3 - 终极全能修正版)
 # 功能：自动架构检测、配置管理、安全备份、UI美化、自动更新、版本对比
 # 新增：实时日志、配置备份、协议切换、端口健康检测、安全卸载
+# 修正：修复了更新源覆盖导致语法错误的问题
 # ==============================================================================
 
 # --- 全局变量与配置 ---
 CONFIG_DIR="/etc/cloudflared"
 CONFIG_FILE="$CONFIG_DIR/config.yml"
 CRED_DIR="/root/.cloudflared"
-GH_PROXY="https://ghfast.top/" # GitHub 加速代理，如果是国外机器可留空 ""
-SCRIPT_URL="https://raw.githubusercontent.com/ioiy/hinas-cf/main/cf.sh" # 脚本更新地址
+GH_PROXY="https://ghfast.top/" # GitHub 加速代理
+# 注意：为了防止误更新导致脚本损坏，已默认留空。如果您有自己的维护地址可填入。
+SCRIPT_URL="" 
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -32,7 +34,7 @@ print_logo() {
     clear
     local current_ver=$(get_script_version "$0")
     echo -e "${BLUE}=============================================================${PLAIN}"
-    echo -e "${CYAN}    Cloudflared Tunnel Manager ${YELLOW}($current_ver Enhanced)${PLAIN}"
+    echo -e "${CYAN}    Cloudflared Tunnel Manager ${YELLOW}($current_ver Fixed)${PLAIN}"
     echo -e "${BLUE}=============================================================${PLAIN}"
     echo -e "  ${PLAIN}专注于管理本机隧道配置、域名路由与服务状态"
     echo -e "  ${PLAIN}当前架构: ${YELLOW}$(uname -m)${PLAIN} | 配置文件: ${YELLOW}$CONFIG_FILE${PLAIN}"
@@ -294,13 +296,13 @@ list_local_domains() {
     printf "%-30s | %-30s\n" "域名 (Hostname)" "指向本地服务 (Service)"
     echo "----------------------------------------------------------------"
     
-    if command -v python3 &> /dev/null; 键，然后
+    if command -v python3 &> /dev/null; then
         python3 -c "$(get_python_parser)" "$CONFIG_FILE" | while IFS='|' read -r host svc; do
              printf "${GREEN}%-30s${PLAIN} | ${YELLOW}%-30s${PLAIN}\n" "$host" "$svc"
         done
     else
         grep -B1 "service:" "$CONFIG_FILE" | grep "hostname:" -A1 | while read -r line; do
-            if [[ "$line" =~ hostname: ]]; 键，然后
+            if [[ "$line" =~ hostname: ]]; then
                 host=$(echo "$line" | cut -d: -f2- | tr -d ' ')
                 read -r next_line
                 svc=$(echo "$next_line" | cut -d: -f2- | tr -d ' ')
@@ -325,7 +327,7 @@ manage_domains() {
         echo ""
         read -p "请选择: " dom_choice
 
-        case $dom_choice 在
+        case $dom_choice in
             1) add_domain_logic ;;
             2) delete_domain_logic ;;
             3) return ;;
@@ -341,7 +343,7 @@ add_domain_logic() {
     fi
 
     local TUNNEL_UUID=$(grep "^tunnel:" "$CONFIG_FILE" | awk '{print $2}')
-    if [ -z "$TUNNEL_UUID" ]; 键，然后
+    if [ -z "$TUNNEL_UUID" ]; then
         msg_error "配置文件中无法读取 Tunnel UUID。"
         pause; return
     fi
@@ -361,7 +363,7 @@ add_domain_logic() {
          msg_warn "警告：无法连接到本地服务 $NEW_SVC"
          echo "这可能是因为：服务未启动、防火墙阻止或端口错误。"
          read -p "是否仍然要添加此路由? (y/N): " FORCE
-         if [[ ! "$FORCE" =~ ^[yY]$ ]]; 键，然后
+         if [[ ! "$FORCE" =~ ^[yY]$ ]]; then
              msg_info "操作已取消。"
              return
          fi
@@ -585,8 +587,16 @@ uninstall_cloudflared() {
 update_script() {
     print_logo
     echo -e "${CYAN}=== 脚本自我更新 ===${PLAIN}"
-    msg_info "正在检查脚本更新..."
     
+    if [[ -z "$SCRIPT_URL" ]]; then
+        msg_warn "未配置更新源 (SCRIPT_URL)。"
+        echo "为了防止覆盖您当前定制的 V4.3 版本，自动更新功能已暂停。"
+        echo "如果您有自己的脚本维护地址，请编辑脚本修改 SCRIPT_URL 变量。"
+        pause
+        return
+    fi
+    
+    msg_info "正在检查脚本更新..."
     local TEMP_FILE="/tmp/cf_manager_new.sh"
     local DOWNLOAD_URL="${SCRIPT_URL}"
     
