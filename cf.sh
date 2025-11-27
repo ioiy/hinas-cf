@@ -120,7 +120,7 @@ install_cloudflared() {
 
     # 1. 获取当前版本
     local LOCAL_VER="未安装"
-    if command -v cloudflared &> /dev/null; 键，然后
+    if command -v cloudflared &> /dev/null; then
         LOCAL_VER=$(cloudflared --version 2>/dev/null | awk '{print $3}' | sed 's/,//')
     fi
 
@@ -558,7 +558,7 @@ manage_backups() {
         
         read -p "请输入操作: " op
         
-        case $op 在
+        case $op in
             0) return ;;
             k) 
                if [ ${#backups[@]} -le 5 ]; then
