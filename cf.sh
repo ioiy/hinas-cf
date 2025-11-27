@@ -753,7 +753,7 @@ while true; do
     echo ""
     read -p "请输入选项 [0-10]: " choice
 
-    case $choice 在
+    case $choice in
         1) install_cloudflared ;;
         2) login_cloudflare ;;
         3) create_tunnel_wizard ;;
