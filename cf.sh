@@ -1,589 +1,473 @@
 #!/bin/bash
 
-# Cloudflared 隧道管理脚本 (V3 - 本机安全版)
-# 专注于管理本机的 config.yml 和域名，移除了危险的隧道删除功能。
-# 基于教程: https://bbs.histb.com/d/240-cloudflared-https
+# ==============================================================================
+# Cloudflared 隧道管理脚本 (V4 - 终极美化增强版)
+# 功能：自动架构检测、配置管理、安全备份、UI美化
+# ==============================================================================
 
-# 确保以root权限运行
-if [ "$(id -u)" -ne 0 ]; then
-  echo "此脚本需要root权限运行。请使用 'sudo ./cf.sh' 运行。"
-  exit 1
-fi
-
+# --- 全局变量与配置 ---
 CONFIG_DIR="/etc/cloudflared"
 CONFIG_FILE="$CONFIG_DIR/config.yml"
-CRED_DIR="/root/.cloudflared" # 教程中默认的凭证目录
+CRED_DIR="/root/.cloudflared"
+GH_PROXY="https://ghfast.top/" # GitHub 加速代理，如果是国外机器可留空 ""
 
-# 检查 cloudflared 是否已安装
-check_cloudflared() {
-    if ! command -v cloudflared &> /dev/null; then
-        echo "cloudflared 命令未找到。正在尝试下载 (ARM 32-bit)..."
-        echo "如果您的架构不同，请从 https://github.com/cloudflare/cloudflared/releases 手动下载。"
-        # 注意：教程中的版本较旧，您可以替换为更新的下载链接
-        wget https://ghproxy.futils.com/https://github.com/cloudflare/cloudflared/releases/download/2022.5.1/cloudflared-linux-arm -O /usr/bin/cloudflared
-        if [ $? -ne 0 ]; then
-            echo "下载失败。请手动安装 cloudflared。"
-            exit 1
-        fi
-        chmod 0777 /usr/bin/cloudflared
-    fi
-    # 确保配置目录存在
-    mkdir -p $CONFIG_DIR
+# --- 颜色定义 ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+PLAIN='\033[0m'
+
+# --- 基础工具函数 ---
+
+print_logo() {
+    clear
+    echo -e "${BLUE}=============================================================${PLAIN}"
+    echo -e "${CYAN}    Cloudflared Tunnel Manager ${YELLOW}(V4.0 Enhanced)${PLAIN}"
+    echo -e "${BLUE}=============================================================${PLAIN}"
+    echo -e "  ${PLAIN}专注于管理本机隧道配置、域名路由与服务状态"
+    echo -e "  ${PLAIN}当前架构: ${YELLOW}$(uname -m)${PLAIN} | 配置文件: ${YELLOW}$CONFIG_FILE${PLAIN}"
+    echo -e "${BLUE}-------------------------------------------------------------${PLAIN}"
 }
 
-# 1. 登录 (如果需要)
-login() {
-    echo "----------------------------------------"
-    echo "1. 登录 Cloudflare"
-    echo "----------------------------------------"
-    echo "您将被重定向到一个浏览器窗口进行登录。"
-    echo "请登录并授权您的域名。"
+msg_info() { echo -e "${BLUE}[INFO]${PLAIN} $1"; }
+msg_success() { echo -e "${GREEN}[SUCCESS]${PLAIN} $1"; }
+msg_warn() { echo -e "${YELLOW}[WARN]${PLAIN} $1"; }
+msg_error() { echo -e "${RED}[ERROR]${PLAIN} $1"; }
+
+pause() {
+    echo ""
+    read -n 1 -s -r -p "按任意键返回主菜单..."
+}
+
+# --- 检查环境 ---
+
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}[错误] 此脚本必须以 root 权限运行。${PLAIN}"
+        echo -e "请使用: ${YELLOW}sudo $0${PLAIN}"
+        exit 1
+    fi
+}
+
+check_dependencies() {
+    local deps=("wget" "curl" "grep" "sed" "awk" "systemctl")
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            msg_error "缺少必要命令: $dep"
+            echo "请先安装它 (例如: apt install $dep 或 yum install $dep)"
+            exit 1
+        fi
+    done
+}
+
+# --- 核心功能函数 ---
+
+install_cloudflared() {
+    print_logo
+    echo -e "正在检测系统架构..."
+    
+    local ARCH=$(uname -m)
+    local DOWNLOAD_ARCH=""
+    
+    case $ARCH in
+        x86_64|amd64)  DOWNLOAD_ARCH="amd64" ;;
+        aarch64|arm64) DOWNLOAD_ARCH="arm64" ;;
+        armv7l|armhf)  DOWNLOAD_ARCH="arm" ;;
+        i386|i686)     DOWNLOAD_ARCH="386" ;;
+        *)
+            msg_error "不支持的架构: $ARCH"
+            return
+            ;;
+    esac
+
+    msg_info "检测到架构: ${GREEN}$DOWNLOAD_ARCH${PLAIN}"
+    msg_info "正在获取最新版本信息..."
+
+    # 获取下载链接
+    local BASE_URL="${GH_PROXY}https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${DOWNLOAD_ARCH}"
+    
+    msg_info "开始下载: cloudflared-linux-${DOWNLOAD_ARCH}"
+    wget --no-check-certificate -O /usr/bin/cloudflared "$BASE_URL"
+
+    if [ $? -ne 0 ]; then
+        msg_error "下载失败，请检查网络或更换代理设置。"
+        rm -f /usr/bin/cloudflared
+        pause
+        return
+    fi
+
+    chmod 0755 /usr/bin/cloudflared
+    mkdir -p $CONFIG_DIR
+    
+    msg_success "安装/更新完成！"
+    cloudflared --version
+    pause
+}
+
+login_cloudflare() {
+    print_logo
+    msg_info "即将开始登录流程..."
+    echo -e "${YELLOW}提示：${PLAIN} 您将看到一个 URL，请在浏览器中打开它并授权域名。"
+    echo -e "${YELLOW}提示：${PLAIN} 授权完成后，证书将自动下载。"
+    echo ""
     
     cloudflared login
     
-    echo "登录完成。凭证证书已保存。"
-    read -p "按回车键返回菜单..."
+    if [ -f "$CRED_DIR/cert.pem" ]; then
+        msg_success "登录成功！证书已保存。"
+    else
+        msg_warn "未检测到证书文件，请确认是否登录成功。"
+    fi
+    pause
 }
 
-# 2. 安装/配置新隧道 (本机的初始设置)
-create_tunnel() {
-    echo "----------------------------------------"
-    echo "2. 安装/配置新隧道 (本机的初始设置)"
-    echo "----------------------------------------"
+create_tunnel_wizard() {
+    print_logo
+    echo -e "${CYAN}=== 创建新隧道向导 ===${PLAIN}"
     
     if [ -f "$CONFIG_FILE" ]; then
-        echo "警告： $CONFIG_FILE 已经存在。"
-        read -p "继续操作将覆盖现有配置。确定吗? (y/N): " CONFIRM
-        if [[ ! "$CONFIRM" =~ ^[yY]$ ]]; then
-            echo "操作已取消。"
-            read -p "按回车键返回菜单..."
+        msg_warn "检测到已存在配置文件：$CONFIG_FILE"
+        read -p "是否覆盖并创建全新隧道？这会删除旧配置 (y/N): " choice
+        if [[ ! "$choice" =~ ^[yY]$ ]]; then
+            msg_info "操作已取消。"
+            pause
             return
         fi
+        # 备份旧配置
+        cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
+        msg_info "旧配置已备份。"
     fi
+
+    read -p "请输入隧道名称 (例如: my-nas): " TUNNEL_NAME
+    [[ -z "$TUNNEL_NAME" ]] && { msg_error "名称不能为空"; pause; return; }
+
+    msg_info "正在向 Cloudflare 请求创建隧道..."
+    CREATE_OUTPUT=$(cloudflared tunnel create "$TUNNEL_NAME" 2>&1)
     
-    read -p "请输入【新】隧道的名称 (例如: nas): " TUNNEL_NAME
-    if [ -z "$TUNNEL_NAME" ]; then
-        echo "隧道名称不能为空。"
+    if echo "$CREATE_OUTPUT" | grep -q "Error"; then
+        msg_error "创建失败: $CREATE_OUTPUT"
+        pause
         return
     fi
 
-    echo "正在创建隧道 '$TUNNEL_NAME'..."
-    
-    CREATE_OUTPUT=$(cloudflared tunnel create $TUNNEL_NAME 2>&1)
-    
-    if [ $? -ne 0 ]; then
-        echo "创建隧道失败:"
-        echo "$CREATE_OUTPUT"
-        read -p "按回车键返回菜单..."
-        return
-    fi
-    
-    echo "$CREATE_OUTPUT"
-    
+    # 提取 UUID
     TUNNEL_UUID=$(echo "$CREATE_OUTPUT" | grep -oP 'created tunnel \K[a-f0-9-]{36}')
     
     if [ -z "$TUNNEL_UUID" ]; then
-        echo "无法从输出中自动提取 Tunnel UUID。请检查上面的输出。"
-        read -p "请手动输入 Tunnel UUID: " TUNNEL_UUID
-    fi
-    
-    CRED_FILE="$CRED_DIR/${TUNNEL_UUID}.json"
-    if [ ! -f "$CRED_FILE" ]; then
-        echo "警告：在 $CRED_DIR 中未找到凭证文件 ${TUNNEL_UUID}.json。"
+        msg_warn "自动提取 UUID 失败。"
+        echo "$CREATE_OUTPUT"
+        read -p "请手动输入上方显示的 UUID: " TUNNEL_UUID
     fi
 
-    echo "隧道 UUID: $TUNNEL_UUID"
-    echo "凭证文件: $CRED_FILE"
-    
-    read -p "请输入您要绑定的【第一个】主机名 (例如: nas.yourdomain.com): " HOSTNAME
-    read -p "请输入您要穿透的本地服务地址 (例如: http://127.0.0.1:8080): " SERVICE_URL
-    
-    echo "正在创建配置文件: $CONFIG_FILE"
-    
-    cat > $CONFIG_FILE << EOL
+    local CRED_FILE="$CRED_DIR/${TUNNEL_UUID}.json"
+    msg_success "隧道创建成功！UUID: ${CYAN}$TUNNEL_UUID${PLAIN}"
+
+    # 初始域名设置
+    echo ""
+    echo -e "${YELLOW}--- 配置第一个服务 ---${PLAIN}"
+    read -p "请输入访问域名 (例如: nas.example.com): " HOSTNAME
+    read -p "请输入本地服务 (直接输入端口如 8080 或完整地址 http://...): " SERVICE_INPUT
+
+    # 智能补全本地地址
+    local SERVICE_URL="$SERVICE_INPUT"
+    if [[ "$SERVICE_INPUT" =~ ^[0-9]+$ ]]; then
+        SERVICE_URL="http://127.0.0.1:$SERVICE_INPUT"
+        msg_info "已自动补全本地地址为: $SERVICE_URL"
+    fi
+
+    # 写入配置文件
+    cat > "$CONFIG_FILE" << EOL
 tunnel: $TUNNEL_UUID
 credentials-file: $CRED_FILE
 ingress:
   - hostname: $HOSTNAME
     service: $SERVICE_URL
-  # 默认规则：所有其他流量返回 404
+  # 404 兜底规则 (切勿删除)
   - service: http_status:404
 EOL
 
-    echo "配置文件创建成功。"
-    
-    echo "正在为 '$HOSTNAME' 创建 DNS 记录..."
-    cloudflared tunnel route dns $TUNNEL_NAME $HOSTNAME
-    
-    echo "DNS 记录创建成功。"
-    
-    echo "正在安装并启动 systemd 服务..."
-    cloudflared service install
-    systemctl start cloudflared
-    
-    echo "隧道 '$TUNNEL_NAME' 已创建并启动！"
-    echo "您现在应该可以通过 https://$HOSTNAME 访问。"
-    systemctl status cloudflared --no-pager
-    
-    read -p "按回车键返回菜单..."
+    msg_success "配置文件已生成。"
+
+    msg_info "正在注册 DNS 记录..."
+    cloudflared tunnel route dns "$TUNNEL_NAME" "$HOSTNAME"
+
+    msg_info "正在安装并启动系统服务..."
+    cloudflared service install 2>/dev/null
+    systemctl daemon-reload
+    systemctl enable cloudflared
+    systemctl restart cloudflared
+
+    if systemctl is-active --quiet cloudflared; then
+        msg_success "服务启动成功！"
+        echo -e "访问地址: ${GREEN}https://$HOSTNAME${PLAIN}"
+    else
+        msg_error "服务启动失败，请检查日志。"
+        systemctl status cloudflared --no-pager
+    fi
+    pause
 }
 
-# 3. 列出您 Cloudflare 账户上的【所有】隧道
-list_all_tunnels() {
-    echo "----------------------------------------"
-    echo "3. 列出您 Cloudflare 账户上的【所有】隧道"
-    echo "----------------------------------------"
-    echo "(这显示的是您云端账户中的所有隧道，包括其他机器上的)"
-    cloudflared tunnel list
-    read -p "按回车键返回菜单..."
-}
+# --- 配置文件解析与操作 ---
 
-# 4. 管理本机服务 (systemd)
-manage_service() {
-    echo "----------------------------------------"
-    echo "4. 管理本机服务 (systemd)"
-    echo "----------------------------------------"
-    PS3="请选择操作: "
-    options=("查看状态" "启动服务" "停止服务" "重启服务" "返回主菜单")
-    select opt in "${options[@]}"
-    do
-        case $opt in
-            "查看状态")
-                systemctl status cloudflared --no-pager
-                ;;
-            "启动服务")
-                systemctl start cloudflared
-                systemctl status cloudflared --no-pager
-                ;;
-            "停止服务")
-                systemctl stop cloudflared
-                systemctl status cloudflared --no-pager
-                ;;
-            "重启服务")
-                systemctl restart cloudflared
-                systemctl status cloudflared --no-pager
-                ;;
-            "返回主菜单")
-                break
-                ;;
-            *) echo "无效选项 $REPLY";;
-        esac
-    done
-}
-
-# --- 域名管理帮助函数 ---
-list_domains_from_config() {
-    echo "--- 当前 $CONFIG_FILE 中的域名配置 ---"
-    
-    # V6.0 - 使用Python脚本(如果可用),否则使用简化的bash
-    
-    # 检查是否有Python
-    if command -v python3 &> /dev/null; then
-        # 使用Python内联脚本
-        python3 - "$CONFIG_FILE" << 'PYEOF'
+# 辅助：获取 Python 解析脚本 (用于读取 YAML)
+get_python_parser() {
+    cat << 'PYEOF'
 import sys, re
 try:
     with open(sys.argv[1], 'r') as f:
         lines = f.readlines()
-    in_ingress, hostname = False, None
+    
+    in_ingress = False
+    results = []
+    
     for line in lines:
         line = line.rstrip('\n')
+        # 简单状态机
         if line.strip() == 'ingress:':
             in_ingress = True
             continue
-        if not in_ingress:
+        if not in_ingress: continue
+        
+        # 匹配 hostname
+        m_host = re.match(r'^\s*-\s*hostname:\s*(.+)$', line)
+        if m_host:
+            current_host = m_host.group(1).strip()
+            # 预读取下一行找 service (假设格式规范)
             continue
-        m = re.match(r'^\s*-\s*hostname:\s*(.+)$', line)
-        if m:
-            hostname = m.group(1).strip()
-            continue
-        m = re.match(r'^\s*service:\s*(.+)$', line)
-        if m and hostname:
-            service = m.group(1).strip()
-            if service == 'http_status:404':
-                break
-            pm = re.search(r':(\d+)$', service)
-            if pm:
-                print(f" -> {hostname}:{pm.group(1)}")
-            else:
-                print(f" -> {hostname}:80/443")
-            hostname = None
+            
+        # 匹配 service
+        m_svc = re.match(r'^\s*service:\s*(.+)$', line)
+        if m_svc:
+            svc = m_svc.group(1).strip()
+            if 'http_status:404' in svc: break
+            # 如果之前读到了 hostname，这里尝试匹配
+            # 这是一个简化的解析，假设 hostname 和 service 是成对出现的
+            pass 
+            
+    # 由于 bash/python 交互复杂，这里使用更简单的纯正则提取用于显示
+    content = "".join(lines)
+    # 查找所有 hostname 和 service 对
+    # 这是一个非贪婪匹配
+    matches = re.findall(r'-\s+hostname:\s+(.*?)\s+service:\s+(.*?)\n', content, re.DOTALL)
+    for h, s in matches:
+        s = s.strip()
+        if 'http_status:404' not in s:
+            print(f"{h.strip()}|{s}")
+
 except Exception as e:
-    print(f"错误: {e}")
+    pass
 PYEOF
+}
+
+list_local_domains() {
+    echo -e "${CYAN}--- 当前配置的域名列表 ($CONFIG_FILE) ---${PLAIN}"
+    printf "%-30s | %-30s\n" "域名 (Hostname)" "指向本地服务 (Service)"
+    echo "----------------------------------------------------------------"
+    
+    if command -v python3 &> /dev/null; then
+        # Python 方式 (更准)
+        python3 -c "$(get_python_parser)" "$CONFIG_FILE" | while IFS='|' read -r host svc; do
+             printf "${GREEN}%-30s${PLAIN} | ${YELLOW}%-30s${PLAIN}\n" "$host" "$svc"
+        done
     else
-        # 备用方案:使用最简单的grep+cut方法
-        grep -B1 "service:" "$CONFIG_FILE" | grep -v "^--$" | while IFS= read -r line; do
-            if echo "$line" | grep -q "hostname:"; then
-                h=$(echo "$line" | cut -d: -f2- | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
-                read -r svc
-                if echo "$svc" | grep -q "http_status:404"; then
-                    break
-                fi
-                # 检查端口
-                if echo "$svc" | grep -qE ':[0-9]+$'; then
-                    p=$(echo "$svc" | rev | cut -d: -f1 | rev)
-                    echo " -> $h:$p"
-                else
-                    echo " -> $h:80/443"
+        # Bash 兜底方式
+        grep -B1 "service:" "$CONFIG_FILE" | grep "hostname:" -A1 | while read -r line; do
+            if [[ "$line" =~ hostname: ]]; then
+                host=$(echo "$line" | cut -d: -f2- | tr -d ' ')
+                read -r next_line
+                svc=$(echo "$next_line" | cut -d: -f2- | tr -d ' ')
+                if [[ "$svc" != *"http_status:404"* ]]; then
+                    printf "${GREEN}%-30s${PLAIN} | ${YELLOW}%-30s${PLAIN}\n" "$host" "$svc"
                 fi
             fi
         done
     fi
-    
-    echo "----------------------------------------"
+    echo "----------------------------------------------------------------"
 }
 
-add_domain() {
-    echo "--- 添加新域名到 $CONFIG_FILE ---"
-    
-    # 从本机config.yml中读取隧道UUID
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "错误: 配置文件 $CONFIG_FILE 不存在"
-        read -p "按回车键返回..."
-        return
-    fi
-    
-    TUNNEL_UUID=$(grep "^tunnel:" "$CONFIG_FILE" | cut -d: -f2- | tr -d ' ')
-    
-    if [ -z "$TUNNEL_UUID" ]; then
-        echo "错误: 无法从 $CONFIG_FILE 中读取隧道UUID"
-        read -p "按回车键返回..."
-        return
-    fi
-    
-    # 尝试获取隧道名称(静默失败)
-    TUNNEL_NAME=$(cloudflared tunnel info $TUNNEL_UUID 2>/dev/null | grep "^Name:" | cut -d: -f2- | tr -d ' ')
-    
-    # 如果获取失败,直接使用UUID(UUID也可以用于DNS路由)
-    if [ -z "$TUNNEL_NAME" ]; then
-        TUNNEL_NAME=$TUNNEL_UUID
-    fi
-    
-    echo "本机隧道: $TUNNEL_NAME"
-    echo "----------------------------------------"
-
-    read -p "请输入【新】域名 (例如: jellyfin.yourdomain.com): " NEW_HOST
-    read -p "请输入该域名对应的【本地服务地址】 (例如: http://127.0.0.1:8096): " NEW_SERVICE
-    
-    if [ -z "$NEW_HOST" ] || [ -z "$NEW_SERVICE" ]; then
-        echo "域名和服务地址都不能为空。"
-        return
-    fi
-    
-    # 验证服务地址格式
-    if ! echo "$NEW_SERVICE" | grep -qE '^https?://'; then
-        echo "警告: 服务地址格式不正确。"
-        echo "服务地址必须以 http:// 或 https:// 开头"
-        echo "例如: http://127.0.0.1:8096"
-        echo ""
-        read -p "是否自动添加 http:// 前缀? (Y/n): " AUTO_FIX
-        if [[ ! "$AUTO_FIX" =~ ^[nN]$ ]]; then
-            # 如果只输入了端口号
-            if echo "$NEW_SERVICE" | grep -qE '^[0-9]+$'; then
-                NEW_SERVICE="http://127.0.0.1:$NEW_SERVICE"
-                echo "已修正为: $NEW_SERVICE"
-            else
-                NEW_SERVICE="http://$NEW_SERVICE"
-                echo "已修正为: $NEW_SERVICE"
-            fi
-        else
-            echo "操作已取消。"
-            return
-        fi
-    fi
-    
-    # 检查是否已有 404 规则
-    if ! grep -q "http_status:404" "$CONFIG_FILE"; then
-        echo "警告: 您的 $CONFIG_FILE 中没有 'service: http_status:404' 规则。"
-        echo "将把新规则追加到文件末尾..."
-        echo "  - hostname: $NEW_HOST" >> $CONFIG_FILE
-        echo "    service: $NEW_SERVICE" >> $CONFIG_FILE
-    else
-        echo "正在将新域名规则插入到 404 规则之前..."
-        # 使用 sed 在 404 规则前插入
-        sed -i "/^[[:space:]]*- service: http_status:404/i \ \ - hostname: $NEW_HOST\n    service: $NEW_SERVICE" $CONFIG_FILE
-    fi
-
-    if [ $? -ne 0 ]; then
-        echo "错误：修改 $CONFIG_FILE 失败。"
-        return
-    fi
-    
-    echo "配置文件已更新。"
-    echo "正在为 $NEW_HOST 创建 DNS 路由..."
-    cloudflared tunnel route dns $TUNNEL_NAME $NEW_HOST
-    
-    echo "正在重启 cloudflared 服务以应用更改..."
-    systemctl restart cloudflared
-    
-    echo "完成！新域名 $NEW_HOST 已添加并指向 $NEW_SERVICE。"
-    systemctl status cloudflared --no-pager
-}
-
-delete_domain() {
-    echo "--- 从 $CONFIG_FILE 删除域名 ---"
-    list_domains_from_config
-    
-    read -p "请输入您要删除的【完整主机名】 (例如: bt.yourdomain.com): " HOST_TO_DELETE
-    if [ -z "$HOST_TO_DELETE" ]; then
-        echo "主机名不能为空。"
-        return
-    fi
-    
-    # 检查域名是否存在于文件中
-    if ! grep -q "hostname: $HOST_TO_DELETE" "$CONFIG_FILE"; then
-        echo "错误：在 $CONFIG_FILE 中未找到主机名 '$HOST_TO_DELETE'。"
-        return
-    fi
-    
-    echo "正在从 $CONFIG_FILE 中删除 '$HOST_TO_DELETE' 及其服务..."
-    
-    # 使用 sed 查找匹配 'hostname: ...' 的行，并删除它及它的下一行 (+1)
-    sed -i -e "/^[[:space:]]*- hostname: $HOST_TO_DELETE$/,+1 d" $CONFIG_FILE
-
-    if [ $? -ne 0 ]; then
-        echo "错误：修改 $CONFIG_FILE 失败。"
-        return
-    fi
-    
-    echo "配置文件已更新。"
-    echo "注意：DNS CNAME 记录 ($HOST_TO_DELETE) 仍然存在于 Cloudflare。"
-    echo "它现在将返回 404，因为它已从隧道配置中移除。"
-    
-    echo "正在重启 cloudflared 服务以应用更改..."
-    systemctl restart cloudflared
-    
-    echo "完成！已删除域名 $HOST_TO_DELETE 的本地路由。"
-    systemctl status cloudflared --no-pager
-}
-# --- 结束帮助函数 ---
-
-
-# 5. 【重点】管理本机的域名 (config.yml)
-manage_local_domains() {
-    echo "----------------------------------------"
-    echo "5. 管理本机的域名 (config.yml)"
-    echo "----------------------------------------"
-    
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "错误: 配置文件 $CONFIG_FILE 未找到。"
-        echo "请先使用 '安装/配置新隧道' (选项2) 创建一个配置。"
-        read -p "按回车键返回菜单..."
-        return
-    fi
-
+manage_domains() {
     while true; do
-        echo "--- 域名管理子菜单 ---"
-        echo "1. 查看当前配置的域名"
-        echo "2. 添加一个新的域名"
-        echo "3. 删除一个已配置的域名"
-        echo "4. 返回主菜单"
-        echo "----------------------"
-        read -p "请选择操作 [1-4]: " domain_choice
-        
-        case $domain_choice in
+        print_logo
+        echo -e "${CYAN}=== 域名与路由管理 ===${PLAIN}"
+        list_local_domains
+        echo ""
+        echo "1. 添加新域名"
+        echo "2. 删除域名"
+        echo "3. 返回主菜单"
+        echo ""
+        read -p "请选择: " dom_choice
+
+        case $dom_choice in
             1)
-                list_domains_from_config
-                read -p "按回车键返回..."
+                add_domain_logic
                 ;;
             2)
-                add_domain
-                read -p "按回车键返回..."
-                break
+                delete_domain_logic
                 ;;
             3)
-                delete_domain
-                read -p "按回车键返回..."
-                break
+                return
                 ;;
-            4)
-                break
+            *)
+                msg_error "无效输入"
+                sleep 1
                 ;;
-            *) echo "无效选项 $REPLY";;
         esac
     done
 }
 
+add_domain_logic() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        msg_error "找不到配置文件，请先创建隧道。"
+        pause; return
+    fi
 
-# 6. 更新 cloudflared
-update_cloudflared() {
-    echo "----------------------------------------"
-    echo "6. 更新 cloudflared"
-    echo "----------------------------------------"
+    # 获取隧道名称 (用于 DNS)
+    local TUNNEL_UUID=$(grep "^tunnel:" "$CONFIG_FILE" | awk '{print $2}')
+    if [ -z "$TUNNEL_UUID" ]; then
+        msg_error "配置文件中无法读取 Tunnel UUID。"
+        pause; return
+    fi
+
+    echo ""
+    read -p "请输入新域名 (例如: plex.example.com): " NEW_HOST
+    read -p "请输入本地端口或地址 (例如 32400 或 http://192.168.1.5:80): " SVC_IN
+
+    # 智能补全
+    local NEW_SVC="$SVC_IN"
+    if [[ "$SVC_IN" =~ ^[0-9]+$ ]]; then
+        NEW_SVC="http://127.0.0.1:$SVC_IN"
+    fi
+
+    msg_info "将添加映射: $NEW_HOST -> $NEW_SVC"
     
-    # 检测系统架构
-    ARCH=$(uname -m)
-    echo "检测到系统架构: $ARCH"
+    # 备份
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+
+    # 使用 sed 在 http_status:404 之前插入两行
+    # 注意：这里假设 yaml 缩进是 2 个空格，这是 cloudflared 默认格式
+    # 插入逻辑：找到 '- service: http_status:404'，在它前面插入 hostname 和 service
     
-    # 获取当前版本
-    CURRENT_VERSION=$(cloudflared version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "未知")
-    echo "当前版本: $CURRENT_VERSION"
+    local INSERT_STR="  - hostname: $NEW_HOST\n    service: $NEW_SVC"
     
-    # 获取最新版本信息
-    echo "正在检查最新版本..."
-    LATEST_RELEASE=$(curl -s https://api.github.com/repos/cloudflare/cloudflared/releases/latest)
+    if grep -q "http_status:404" "$CONFIG_FILE"; then
+        sed -i "/- service: http_status:404/i $INSERT_STR" "$CONFIG_FILE"
+    else
+        # 如果没有 404 规则，直接追加
+        echo -e "$INSERT_STR" >> "$CONFIG_FILE"
+        echo "  - service: http_status:404" >> "$CONFIG_FILE"
+    fi
+
+    if [ $? -eq 0 ]; then
+        msg_success "配置已更新。"
+        msg_info "正在添加 Cloudflare DNS 记录..."
+        cloudflared tunnel route dns "$TUNNEL_UUID" "$NEW_HOST"
+        
+        msg_info "重启服务以应用更改..."
+        systemctl restart cloudflared
+        msg_success "完成！"
+    else
+        msg_error "修改配置文件失败，已恢复备份。"
+        mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
+    fi
+    sleep 2
+}
+
+delete_domain_logic() {
+    echo ""
+    read -p "请输入要删除的完整域名 (例如: nas.example.com): " DEL_HOST
     
-    if [ -z "$LATEST_RELEASE" ]; then
-        echo "错误: 无法获取最新版本信息。请检查网络连接。"
-        read -p "按回车键返回菜单..."
+    if ! grep -q "$DEL_HOST" "$CONFIG_FILE"; then
+        msg_error "配置文件中找不到域名: $DEL_HOST"
+        sleep 2
         return
     fi
+
+    # 备份
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+    msg_info "正在删除配置..."
     
-    LATEST_VERSION=$(echo "$LATEST_RELEASE" | grep -oP '"tag_name":\s*"\K[^"]+' || echo "")
-    echo "最新版本: $LATEST_VERSION"
+    # 删除 hostname 行以及它后面的一行 (service 行)
+    sed -i "/hostname: $DEL_HOST/,+1d" "$CONFIG_FILE"
+
+    msg_success "已从本地配置移除。"
+    msg_warn "注意：DNS 记录并未删除 (通常无需删除，它只会变无效)。"
     
-    # 检查架构支持
-    case "$ARCH" in
-        armv7l|armv7*)
-            ASSET_NAME="cloudflared-linux-arm"
-            echo "将下载 ARM 32-bit 版本"
-            ;;
-        aarch64|arm64)
-            ASSET_NAME="cloudflared-linux-arm64"
-            echo "将下载 ARM 64-bit 版本"
-            ;;
-        x86_64|amd64)
-            ASSET_NAME="cloudflared-linux-amd64"
-            echo "将下载 x86_64 版本"
-            ;;
-        i386|i686)
-            ASSET_NAME="cloudflared-linux-386"
-            echo "将下载 x86 32-bit 版本"
-            ;;
-        *)
-            echo "错误: 不支持的架构 '$ARCH'"
-            echo "请访问 https://github.com/cloudflare/cloudflared/releases 手动下载"
-            read -p "按回车键返回菜单..."
-            return
-            ;;
-    esac
-    
-    # 检查该版本是否有对应架构的包
-    ASSET_URL=$(echo "$LATEST_RELEASE" | grep -oP "\"browser_download_url\":\s*\"[^\"]*${ASSET_NAME}\"" | grep -oP 'https://[^"]+' || echo "")
-    
-    if [ -z "$ASSET_URL" ]; then
-        echo "警告: 最新版本 $LATEST_VERSION 没有 $ASSET_NAME 的发布包"
-        echo "您的架构可能不再被支持,或者发布包命名已更改"
-        read -p "是否查看所有可用的发布包? (y/N): " VIEW_ASSETS
-        if [[ "$VIEW_ASSETS" =~ ^[yY]$ ]]; then
-            echo "可用的包:"
-            echo "$LATEST_RELEASE" | grep -oP '"name":\s*"cloudflared-[^"]+"' | sed 's/"name": "/  - /'
-        fi
-        read -p "按回车键返回菜单..."
-        return
-    fi
-    
-    echo "下载地址: $ASSET_URL"
-    
-    # 确认更新
-    if [ "$CURRENT_VERSION" != "未知" ] && [ "$CURRENT_VERSION" = "${LATEST_VERSION#v}" ]; then
-        echo "您已经是最新版本了!"
-        read -p "按回车键返回菜单..."
-        return
-    fi
-    
-    read -p "是否继续更新? (y/N): " CONFIRM
-    if [[ ! "$CONFIRM" =~ ^[yY]$ ]]; then
-        echo "更新已取消"
-        read -p "按回车键返回菜单..."
-        return
-    fi
-    
-    # 停止服务
-    echo "正在停止 cloudflared 服务..."
-    systemctl stop cloudflared 2>/dev/null
-    
-    # 备份当前版本
-    if [ -f "/usr/bin/cloudflared" ]; then
-        echo "备份当前版本到 /usr/bin/cloudflared.backup"
-        cp /usr/bin/cloudflared /usr/bin/cloudflared.backup
-    fi
-    
-    # 下载新版本
-    echo "正在下载 $LATEST_VERSION ..."
-    wget -O /tmp/cloudflared.new "$ASSET_URL"
-    
-    if [ $? -ne 0 ]; then
-        echo "错误: 下载失败"
-        echo "正在恢复服务..."
-        systemctl start cloudflared 2>/dev/null
-        read -p "按回车键返回菜单..."
-        return
-    fi
-    
-    # 安装新版本
-    echo "正在安装新版本..."
-    chmod +x /tmp/cloudflared.new
-    mv /tmp/cloudflared.new /usr/bin/cloudflared
-    
-    # 验证安装
-    NEW_VERSION=$(/usr/bin/cloudflared version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "未知")
-    echo "安装后的版本: $NEW_VERSION"
-    
-    # 重启服务
-    echo "正在重启 cloudflared 服务..."
-    systemctl start cloudflared
-    
-    echo "更新完成!"
+    msg_info "重启服务..."
+    systemctl restart cloudflared
+    msg_success "完成！"
+    sleep 2
+}
+
+service_status() {
+    print_logo
+    echo -e "${CYAN}=== 系统服务状态 ===${PLAIN}"
+    echo ""
     systemctl status cloudflared --no-pager
+    echo ""
+    echo -e "${BLUE}操作选项:${PLAIN}"
+    echo "1. 启动服务"
+    echo "2. 停止服务"
+    echo "3. 重启服务"
+    echo "4. 设置开机自启"
+    echo "5. 返回"
     
-    read -p "按回车键返回菜单..."
+    read -p "请选择: " svc_opt
+    case $svc_opt in
+        1) systemctl start cloudflared && msg_success "已启动";;
+        2) systemctl stop cloudflared && msg_warn "已停止";;
+        3) systemctl restart cloudflared && msg_success "已重启";;
+        4) systemctl enable cloudflared && msg_success "已设置开机自启";;
+        *) return ;;
+    esac
+    pause
 }
 
-# --- 主程序 ---
+# --- 主逻辑 ---
 
-# 启动时检查
-check_cloudflared
+check_root
+check_dependencies
 
-# 主菜单
-show_menu() {
-    clear
-    echo "========================================"
-    echo "    Cloudflared 隧道管理脚本 (V4)"
-    echo "    (安全版 - 仅管理本机)"
-    echo "========================================"
-    echo "1. 登录 Cloudflare (首次使用或更换账户时)"
-    echo "2. 安装/配置【新】隧道 (本机初始设置)"
-    echo "3. 列出您 Cloudflare 账户上的【所有】隧道"
-    echo "4. 管理本机服务 (启动/停止/状态)"
-    echo "5. 管理本机的【域名】(添加/删除/查看)"
-    echo "6. 更新 cloudflared"
-    echo "7. 退出"
-    echo "----------------------------------------"
-}
-
-# 主循环
 while true; do
-    show_menu
-    read -p "请输入您的选择 [1-7]: " choice
-    
+    print_logo
+    echo -e "1. ${GREEN}安装 / 更新 Cloudflared${PLAIN} ${YELLOW}(智能架构检测)${PLAIN}"
+    echo -e "2. ${GREEN}登录 Cloudflare 账户${PLAIN}"
+    echo -e "3. ${GREEN}创建新隧道 (本机向导)${PLAIN}"
+    echo -e "4. ${CYAN}管理域名 (添加/删除 本地路由)${PLAIN} ${RED}[常用]${PLAIN}"
+    echo -e "5. ${CYAN}服务管理 (启动/停止/日志)${PLAIN}"
+    echo -e "6. 列出云端所有隧道"
+    echo -e "0. 退出"
+    echo ""
+    read -p "请输入选项 [0-6]: " choice
+
     case $choice in
-        1)
-            login
-            ;;
-        2)
-            create_tunnel
-            ;;
-        3)
-            list_all_tunnels
-            ;;
-        4)
-            manage_service
-            ;;
-        5)
-            manage_local_domains # 核心功能
-            ;;
-        6)
-            update_cloudflared # 更新功能
-            ;;
-        7)
-            echo "退出脚本。"
-            exit 0
-            ;;
-        *)
-            echo "无效输入，请输入 1 到 7 之间的数字。"
-            read -p "按回车键继续..."
-            ;;
+        1) install_cloudflared ;;
+        2) login_cloudflare ;;
+        3) create_tunnel_wizard ;;
+        4) manage_domains ;;
+        5) service_status ;;
+        6) 
+           print_logo
+           cloudflared tunnel list
+           pause
+           ;;
+        0) exit 0 ;;
+        *) msg_error "无效选项"; sleep 1 ;;
     esac
 done
+```
+
+### 脚本使用说明
+
+1.  **保存脚本：**
+    将上述代码保存为 `cf.sh`。
+
+2.  **赋予执行权限：**
+    ```bash
+    chmod +x cf.sh
+    ```
+
+3.  **运行脚本：**
+    ```bash
+    sudo ./cf.sh
