@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # ==============================================================================
-# Cloudflared 隧道管理脚本 (V4.7 - 终极全能修正版 III)
-# 功能：自动架构检测、配置管理、安全备份、UI美化、自动更新、版本对比
-# V4.7改进：升级备份清理功能为“备份管理器”，支持指定删除、批量清理
+# Cloudflared 隧道管理脚本 (V4.8 - 终极全能稳定版)
+# 功能：自动架构检测、配置管理、安全备份、UI美化、资源监控、备份管理
+# V4.8变更：由于远程仓库源文件损坏，已暂时禁用自动更新功能以避免报错
 # ==============================================================================
 
 # --- 全局变量与配置 ---
@@ -11,7 +11,10 @@ CONFIG_DIR="/etc/cloudflared"
 CONFIG_FILE="$CONFIG_DIR/config.yml"
 CRED_DIR="/root/.cloudflared"
 GH_PROXY="https://ghfast.top/" # GitHub 加速代理
-SCRIPT_URL="https://raw.githubusercontent.com/ioiy/hinas-cf/main/cf.sh"
+
+# [重要] 远程更新源目前存在语法错误，已留空以禁用更新功能
+SCRIPT_URL="" 
+# 原地址备份 (等对方修复后再填回): https://raw.githubusercontent.com/ioiy/hinas-cf/main/cf.sh
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -32,7 +35,7 @@ print_logo() {
     clear
     local current_ver=$(get_script_version "$0")
     echo -e "${BLUE}=============================================================${PLAIN}"
-    echo -e "${CYAN}    Cloudflared Tunnel Manager ${YELLOW}($current_ver Ultimate)${PLAIN}"
+    echo -e "${CYAN}    Cloudflared Tunnel Manager ${YELLOW}($current_ver Stable)${PLAIN}"
     echo -e "${BLUE}=============================================================${PLAIN}"
     
     # --- 资源监控 (全局常驻) ---
@@ -776,6 +779,7 @@ update_script() {
     
     if [[ -z "$SCRIPT_URL" ]]; then
         msg_warn "未配置更新源 (SCRIPT_URL)。"
+        echo -e "${YELLOW}原因：上游远程仓库代码存在损坏，为安全起见，自动更新已暂时禁用。${PLAIN}"
         pause; return
     fi
     
