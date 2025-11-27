@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # ==============================================================================
-# Cloudflared 隧道管理脚本 (V4.8 - 终极全能稳定版)
-# 功能：自动架构检测、配置管理、安全备份、UI美化、资源监控、备份管理
-# V4.8变更：由于远程仓库源文件损坏，已暂时禁用自动更新功能以避免报错
+# Cloudflared 隧道管理脚本 (V5.0 - 终极全能完整版)
+# 功能：自动架构检测、配置管理、安全备份、UI美化、资源监控
+# V5.0修正：修复备份管理器无法识别 .tar.gz 压缩包的问题
 # ==============================================================================
 
 # --- 全局变量与配置 ---
@@ -12,9 +12,8 @@ CONFIG_FILE="$CONFIG_DIR/config.yml"
 CRED_DIR="/root/.cloudflared"
 GH_PROXY="https://ghfast.top/" # GitHub 加速代理
 
-# [重要] 远程更新源目前存在语法错误，已留空以禁用更新功能
-SCRIPT_URL="" 
-# 原地址备份 (等对方修复后再填回): https://raw.githubusercontent.com/ioiy/hinas-cf/main/cf.sh
+# [恢复更新源] 配合下方的语法检查机制 (bash -n)，即使源文件损坏也能安全拦截
+SCRIPT_URL="https://raw.githubusercontent.com/ioiy/hinas-cf/main/cf.sh"
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -35,7 +34,7 @@ print_logo() {
     clear
     local current_ver=$(get_script_version "$0")
     echo -e "${BLUE}=============================================================${PLAIN}"
-    echo -e "${CYAN}    Cloudflared Tunnel Manager ${YELLOW}($current_ver Stable)${PLAIN}"
+    echo -e "${CYAN}    Cloudflared Tunnel Manager ${YELLOW}($current_ver Ultimate)${PLAIN}"
     echo -e "${BLUE}=============================================================${PLAIN}"
     
     # --- 资源监控 (全局常驻) ---
@@ -530,16 +529,19 @@ backup_config() {
     pause
 }
 
+# --- 修正点：让管理功能识别 /root/ 下的 .tar.gz 文件 ---
 manage_backups() {
     while true; do
         print_logo
         echo -e "${CYAN}=== 备份文件管理 ===${PLAIN}"
+        echo -e "${YELLOW}说明：管理位于 /root/ 下的 .tar.gz 压缩备份包${PLAIN}"
         
-        # 获取所有备份文件并按名称排序
-        local backups=($(ls $CONFIG_FILE.bak.* 2>/dev/null | sort))
+        # 扫描 /root/ 下的备份文件
+        local backups=($(ls /root/cloudflared_backup_*.tar.gz 2>/dev/null | sort))
         
         if [ ${#backups[@]} -eq 0 ]; then
-            echo "没有找到备份文件。"
+            echo ""
+            echo "没有找到备份文件 (cloudflared_backup_*.tar.gz)。"
             echo ""
             read -n 1 -s -r -p "按任意键返回..."
             return
@@ -567,7 +569,7 @@ manage_backups() {
                if [ ${#backups[@]} -le 5 ]; then
                    msg_warn "备份数量未超过 5 个，无需清理。"
                else
-                   ls -rt $CONFIG_FILE.bak.* | head -n -5 | xargs rm -f
+                   ls -rt /root/cloudflared_backup_*.tar.gz | head -n -5 | xargs rm -f
                    msg_success "已清理旧备份，仅保留最新 5 份。"
                fi
                sleep 2
@@ -575,7 +577,7 @@ manage_backups() {
             a)
                read -p "确认删除所有备份? (y/N): " confirm
                if [[ "$confirm" =~ ^[yY]$ ]]; then
-                   rm -f $CONFIG_FILE.bak.*
+                   rm -f /root/cloudflared_backup_*.tar.gz
                    msg_success "已清空所有备份。"
                    sleep 2
                    return
@@ -779,7 +781,6 @@ update_script() {
     
     if [[ -z "$SCRIPT_URL" ]]; then
         msg_warn "未配置更新源 (SCRIPT_URL)。"
-        echo -e "${YELLOW}原因：上游远程仓库代码存在损坏，为安全起见，自动更新已暂时禁用。${PLAIN}"
         pause; return
     fi
     
@@ -809,7 +810,6 @@ update_script() {
     fi
     
     # --- 关键修改：语法安全检查 ---
-    # 这将拦截所有语法错误（如 'case $choice 在'），防止覆盖本地脚本
     if ! bash -n "$TEMP_FILE"; then
         echo ""
         msg_error "严重安全警告：下载的远程脚本包含语法错误！"
