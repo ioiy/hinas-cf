@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==============================================================================
-# Cloudflared 隧道管理脚本 (V4.1 - 终极美化增强版)
-# 功能：自动架构检测、配置管理、安全备份、UI美化、自动更新
+# Cloudflared 隧道管理脚本 (V4.2 - 终极美化增强版)
+# 功能：自动架构检测、配置管理、安全备份、UI美化、自动更新、版本对比
 # ==============================================================================
 
 # --- 全局变量与配置 ---
@@ -22,10 +22,16 @@ PLAIN='\033[0m'
 
 # --- 基础工具函数 ---
 
+# 提取脚本版本号
+get_script_version() {
+    grep -o "V[0-9.]\+" "$1" | head -n 1
+}
+
 print_logo() {
     clear
+    local current_ver=$(get_script_version "$0")
     echo -e "${BLUE}=============================================================${PLAIN}"
-    echo -e "${CYAN}    Cloudflared Tunnel Manager ${YELLOW}(V4.1 Enhanced)${PLAIN}"
+    echo -e "${CYAN}    Cloudflared Tunnel Manager ${YELLOW}($current_ver Enhanced)${PLAIN}"
     echo -e "${BLUE}=============================================================${PLAIN}"
     echo -e "  ${PLAIN}专注于管理本机隧道配置、域名路由与服务状态"
     echo -e "  ${PLAIN}当前架构: ${YELLOW}$(uname -m)${PLAIN} | 配置文件: ${YELLOW}$CONFIG_FILE${PLAIN}"
@@ -67,6 +73,7 @@ check_dependencies() {
 
 install_cloudflared() {
     print_logo
+    echo -e "${CYAN}=== Cloudflared 更新/安装 ===${PLAIN}"
     echo -e "正在检测系统架构..."
     
     local ARCH=$(uname -m)
@@ -82,11 +89,45 @@ install_cloudflared() {
             return
             ;;
     esac
-
     msg_info "检测到架构: ${GREEN}$DOWNLOAD_ARCH${PLAIN}"
-    msg_info "正在获取最新版本信息..."
 
-    # 获取下载链接
+    # 1. 获取当前版本
+    local LOCAL_VER="未安装"
+    if command -v cloudflared &> /dev/null; then
+        LOCAL_VER=$(cloudflared --version 2>/dev/null | awk '{print $3}' | sed 's/,//')
+    fi
+
+    # 2. 获取最新版本 (尝试从 GitHub 获取)
+    msg_info "正在联网检查最新版本信息..."
+    # 使用 curl 获取跳转后的 URL 来确定版本号，超时设置 5 秒
+    local LATEST_URL=$(curl -Ls -o /dev/null -w %{url_effective} --max-time 10 https://github.com/cloudflare/cloudflared/releases/latest)
+    local REMOTE_VER=$(echo "$LATEST_URL" | awk -F'/' '{print $NF}')
+    
+    if [[ -z "$REMOTE_VER" || "$REMOTE_VER" == "latest" ]]; then
+        REMOTE_VER="检测失败(网络问题)"
+    fi
+
+    echo ""
+    echo -e "----------------------------------------"
+    echo -e "当前版本: ${YELLOW}$LOCAL_VER${PLAIN}"
+    echo -e "最新版本: ${GREEN}$REMOTE_VER${PLAIN}"
+    echo -e "----------------------------------------"
+    echo ""
+
+    if [[ "$LOCAL_VER" == "$REMOTE_VER" && "$LOCAL_VER" != "未安装" ]]; then
+        echo -e "${GREEN}当前已是最新版本。${PLAIN}"
+        read -p "是否强制重新安装? (y/N): " choice
+    else
+        read -p "是否开始安装/更新? (y/N): " choice
+    fi
+
+    if [[ ! "$choice" =~ ^[yY]$ ]]; then
+        msg_info "操作已取消。"
+        pause
+        return
+    fi
+
+    # 开始下载
     local BASE_URL="${GH_PROXY}https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${DOWNLOAD_ARCH}"
     
     msg_info "开始下载: cloudflared-linux-${DOWNLOAD_ARCH}"
@@ -431,16 +472,16 @@ update_script() {
     msg_info "正在检查脚本更新..."
     
     local TEMP_FILE="/tmp/cf_manager_new.sh"
-    
-    # 尝试下载
     local DOWNLOAD_URL="${SCRIPT_URL}"
-    # 如果配置了 GH_PROXY 且 SCRIPT_URL 是 github 链接，尝试拼接代理以便国内更新
+    
+    # 如果配置了 GH_PROXY 且 SCRIPT_URL 是 github 链接
     if [[ -n "$GH_PROXY" && "$SCRIPT_URL" == *"github"* ]]; then
         DOWNLOAD_URL="${GH_PROXY}${SCRIPT_URL}"
     fi
     
-    msg_info "正在从服务器下载最新版本..."
-    wget --no-check-certificate -O "$TEMP_FILE" "$DOWNLOAD_URL"
+    # 1. 下载新版本到临时文件
+    msg_info "正在获取最新脚本版本..."
+    wget --no-check-certificate -q -O "$TEMP_FILE" "$DOWNLOAD_URL"
     
     if [ $? -ne 0 ]; then
         msg_error "下载失败，请检查网络。"
@@ -449,25 +490,50 @@ update_script() {
         return
     fi
     
-    # 完整性检查 (防止下载到 404 页面或空文件)
+    # 2. 完整性检查
     if ! grep -q "Cloudflared Tunnel Manager" "$TEMP_FILE"; then
-        msg_error "下载的文件验证失败 (可能是网络问题或无效文件)。"
+        msg_error "文件校验失败 (无效的文件内容)。"
         rm -f "$TEMP_FILE"
         pause
         return
     fi
 
+    # 3. 版本对比
+    local CURRENT_SCRIPT_VER=$(get_script_version "$0")
+    local REMOTE_SCRIPT_VER=$(get_script_version "$TEMP_FILE")
+
+    echo ""
+    echo -e "----------------------------------------"
+    echo -e "当前脚本版本: ${YELLOW}$CURRENT_SCRIPT_VER${PLAIN}"
+    echo -e "最新脚本版本: ${GREEN}$REMOTE_SCRIPT_VER${PLAIN}"
+    echo -e "----------------------------------------"
+    echo ""
+
+    if [[ "$CURRENT_SCRIPT_VER" == "$REMOTE_SCRIPT_VER" ]]; then
+        read -p "版本已是最新，是否强制覆盖? (y/N): " choice
+    else
+        read -p "发现新版本，是否更新? (y/N): " choice
+    fi
+
+    if [[ ! "$choice" =~ ^[yY]$ ]]; then
+        msg_info "更新已取消。"
+        rm -f "$TEMP_FILE"
+        pause
+        return
+    fi
+
+    # 4. 执行更新
     # 备份当前脚本
     cp "$0" "${0}.bak"
     msg_info "已备份当前脚本到 ${0}.bak"
     
-    # 替换并赋予权限
+    # 替换
     mv "$TEMP_FILE" "$0"
     chmod +x "$0"
     
     msg_success "脚本已更新！即将重新加载..."
     sleep 2
-    # 重新执行当前脚本
+    # 重新执行
     exec "$0"
 }
 
@@ -478,7 +544,7 @@ check_dependencies
 
 while true; do
     print_logo
-    echo -e "1. ${GREEN}安装 / 更新 Cloudflared${PLAIN} ${YELLOW}(智能架构检测)${PLAIN}"
+    echo -e "1. ${GREEN}安装 / 更新 Cloudflared${PLAIN} ${YELLOW}(含版本检测)${PLAIN}"
     echo -e "2. ${GREEN}登录 Cloudflare 账户${PLAIN}"
     echo -e "3. ${GREEN}创建新隧道 (本机向导)${PLAIN}"
     echo -e "4. ${CYAN}管理域名 (添加/删除 本地路由)${PLAIN} ${RED}[常用]${PLAIN}"
