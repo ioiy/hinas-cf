@@ -1,0 +1,32 @@
+Linux System Files
+
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+Cloudflared specific
+
+*.pem
+.json
+config.yml
+cloudflared_backup_.tar.gz
+
+Logs
+
+*.log
+*.journal
+
+Backup files
+
+*.bak
+.bak.
+*.old
+*.tmp
+
+Editor temporary files
+
+*.swp
+*~
+.vscode/
+.idea/
