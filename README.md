@@ -1,4 +1,14 @@
-Cloudflared Tunnel Manager (V4.6) ☁️
+⚠️ 注意事项
+
+必须以 root 用户或使用 sudo 运行。
+
+Token 模式与本地配置模式互斥，安装 Token 模式会覆盖原有的本地服务。
+
+
+
+根据大佬的教程 https://bbs.histb.com/d/240-cloudflared-https 结合ai写出的
+
+Cloudflared Tunnel Manager 
 
 这是一个专为 Linux 设计的 Cloudflare Tunnel 一站式管理脚本。无论是传统的本地配置文件模式，还是网页端的 Token 模式，都能轻松驾驭。
 
@@ -90,12 +100,4 @@ Token 模式安装 (使用网页端 Token 部署)
 
 定时任务 (设置自动重启策略)
 
-⚠️ 注意事项
 
-必须以 root 用户或使用 sudo 运行。
-
-Token 模式与本地配置模式互斥，安装 Token 模式会覆盖原有的本地服务。
-
-
-
-根据大佬的教程 https://bbs.histb.com/d/240-cloudflared-https 结合ai写出的
