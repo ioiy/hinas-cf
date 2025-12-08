@@ -6,7 +6,7 @@ Token 模式与本地配置模式互斥，安装 Token 模式会覆盖原有的�
 
 
 
-根据大佬的教程 https://bbs.histb.com/d/240-cloudflared-https 结合ai写出的
+原大佬的教程 https://bbs.histb.com/d/240-cloudflared-https 
 
 Cloudflared Tunnel Manager 
 
