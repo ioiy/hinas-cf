@@ -3,6 +3,7 @@
 # =================配置区域=================
 CONF_FILE="/etc/socat-v2raya.conf"
 SERVICE_FILE="/etc/systemd/system/socat-v2raya.service"
+VERSION="3.5"
 # =========================================
 
 # 颜色定义
@@ -132,7 +133,6 @@ check_connectivity() {
         fi
         
         # HTTP 测试并测算延迟
-        # curl 参数: -w 输出 %{http_code} 和 %{time_total}
         local curl_cmd="curl -s -o /dev/null -m 3"
         
         # 1. 尝试 HTTP 代理模式测试
@@ -150,7 +150,6 @@ check_connectivity() {
         read -r socks_code socks_total <<< "$res_socks"
         
         if [[ "$socks_code" =~ ^[23] || "$socks_code" == "000" && $(awk "BEGIN {print ($socks_total > 0)?1:0}") -eq 1 ]]; then
-            # 部分 socks5 请求可能由于重定向响应头为空返回 000 但已连通，判断整体耗时
             local ms=$(awk "BEGIN {print int($socks_total * 1000)}")
             printf "${GREEN}%-10s${NC} %-15s %-8s ${GREEN}%-20s${NC} ${GREEN}%-10s${NC}\n" "$lp" "$tp" "TCP" "通 (SOCKS5代理)" "${ms} ms"
         else
@@ -380,34 +379,67 @@ backup_restore_config() {
 # 9. 在线更新脚本 (一键同步 GitHub 最新版)
 update_script() {
     echo -e "\n${BLUE}=== 在线更新脚本 ===${NC}"
-    echo -e "当前脚本路径: $0"
-    echo -e "准备连接 GitHub 并拉取最新版本代码..."
-    echo -e "目标项目: https://github.com/ioiy/hinas-cf"
-    read -p "是否确认更新？(y/n): " confirm
-    if [[ "$confirm" != "y" ]]; then
-        echo -e "${YELLOW}已取消更新。${NC}"
+    echo -e "当前本地脚本版本: ${GREEN}${VERSION}${NC}"
+    echo -e "正在连接 GitHub 获取最新版本信息..."
+    
+    local raw_url="https://raw.githubusercontent.com/ioiy/hinas-cf/main/zf.sh"
+    local temp_file="/tmp/zf_update.sh"
+    
+    # 下载远程脚本临时文件用于提取版本号
+    if ! curl -s -L -m 10 "$raw_url" -o "$temp_file"; then
+        echo -e "${RED}错误：无法连接到 GitHub，请检查您的网络连接或代理！${NC}"
+        rm -f "$temp_file"
+        read -n 1 -s -r -p "按任意键返回..."
         return
     fi
     
-    local temp_file="/tmp/zf_update.sh"
-    # 使用原始 Raw 链接下载
-    local raw_url="https://raw.githubusercontent.com/ioiy/hinas-cf/main/zf.sh"
+    # 提取远程脚本里的 VERSION 变量定义
+    local remote_version=$(grep -E "^VERSION=" "$temp_file" | head -n 1 | cut -d'"' -f2)
     
-    echo "正在下载..."
-    if curl -s -L -m 15 "$raw_url" -o "$temp_file"; then
-        # 简单完整性校验：必须包含 bash 声明及核心重构逻辑
-        if grep -q "rebuild_service" "$temp_file" && grep -q "#!/bin/bash" "$temp_file"; then
-            mv "$temp_file" "$0"
-            chmod +x "$0"
-            echo -e "${GREEN}脚本在线更新成功！正在重新载入并运行新版本...${NC}"
-            sleep 1.5
-            exec "$0"
-        else
-            echo -e "${RED}错误：下载的文件内容不完整或格式不匹配，更新已中断！${NC}"
-            rm -f "$temp_file"
-        fi
+    if [ -z "$remote_version" ]; then
+        echo -e "${YELLOW}警告：远程文件解析版本号失败，远程文件可能非本管理脚本。${NC}"
+        remote_version="未知"
+    fi
+    
+    echo -e "--------------------------------------"
+    echo -e "本地当前版本: ${YELLOW}${VERSION}${NC}"
+    echo -e "远程最新版本: ${CYAN}${remote_version}${NC}"
+    echo -e "--------------------------------------"
+    
+    if [[ "$VERSION" == "$remote_version" ]]; then
+        echo -e "${GREEN}您当前已经是最新版本，无需更新！${NC}"
     else
-        echo -e "${RED}错误：连接 GitHub 失败，请检查本机网络或中转代理！${NC}"
+        echo -e "${YELLOW}检测到新版本可用！${NC}"
+    fi
+    
+    # 第一次确认
+    read -p "是否确认下载并更新脚本？(y/n) [默认n]: " confirm
+    if [[ "$confirm" != "y" ]]; then
+        echo -e "${YELLOW}已取消更新。${NC}"
+        rm -f "$temp_file"
+        read -n 1 -s -r -p "按任意键返回..."
+        return
+    fi
+    
+    # 第二次确认（输入完整 yes）
+    read -p "警告：更新会覆盖当前运行脚本！请输入 [yes] 确认覆盖: " double_confirm
+    if [[ "$double_confirm" != "yes" ]]; then
+        echo -e "${YELLOW}二次确认未通过，已安全取消。${NC}"
+        rm -f "$temp_file"
+        read -n 1 -s -r -p "按任意键返回..."
+        return
+    fi
+    
+    # 再次检查临时文件的合法性
+    if grep -q "rebuild_service" "$temp_file" && grep -q "#!/bin/bash" "$temp_file"; then
+        mv "$temp_file" "$0"
+        chmod +x "$0"
+        echo -e "${GREEN}脚本在线更新成功！正在重新载入并运行新版本...${NC}"
+        sleep 1.5
+        exec "$0"
+    else
+        echo -e "${RED}错误：下载的脚本文件内容不完整，校验失败，已放弃更新！${NC}"
+        rm -f "$temp_file"
     fi
     read -n 1 -s -r -p "按任意键返回..."
 }
@@ -417,7 +449,7 @@ check_dependencies
 while true; do
     clear
     echo -e "${BLUE}======================================${NC}"
-    echo -e "    端口转发与代理管理 (v3.5 Ultimate)"
+    echo -e "    端口转发与代理管理 (v${VERSION} Ultimate)"
     echo -e "${BLUE}======================================${NC}"
     echo -e "${GREEN}1. 连通性测试 (支持多目标与延迟测速)${NC}"
     echo -e "2. 查看系统状态 (Status & ss 监听)"
