@@ -3,7 +3,7 @@
 # =================配置区域=================
 CONF_FILE="/etc/socat-v2raya.conf"
 SERVICE_FILE="/etc/systemd/system/socat-v2raya.service"
-VERSION="3.5"
+VERSION="3.6"
 # =========================================
 
 # 颜色定义
