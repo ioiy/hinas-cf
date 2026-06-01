@@ -1,9 +1,10 @@
 #!/bin/bash
 
 # ==============================================================================
-# Cloudflared 隧道管理脚本 (V5.1 - 终极全能完整版)
+# Cloudflared 隧道管理脚本 (V5.2 - 终极全能完整版)
 # 功能：自动架构检测、配置管理、安全备份、UI美化、资源监控、备份管理
-# V5.1变更：新增手动指定版本号功能，支持降级或安装特定历史版本
+# V5.2变更：添加针对老旧设备(armv7l等)的 2026.5.0 兼容版本一键降级选项
+# V5.0变更：新增手动指定版本号功能，支持降级或安装特定历史版本
 # ==============================================================================
 
 # --- 全局变量与配置 ---
@@ -143,11 +144,12 @@ install_cloudflared() {
     echo ""
 
     echo -e "1. 安装/更新到 ${GREEN}最新版本${PLAIN} ($REMOTE_VER)"
-    echo -e "2. ${YELLOW}手动指定版本号${PLAIN} (用于降级或安装特定历史版本)"
+    echo -e "2. 安装/降级到 ${YELLOW}兼容稳定版 2026.5.0${PLAIN} ${RED}[推荐老旧ARM设备/内核报错 panic 者使用]${PLAIN}"
+    echo -e "3. ${CYAN}手动指定任意版本号${PLAIN} (高级)"
     echo -e "0. 返回上一级"
     echo ""
     
-    read -p "请选择 [1/2/0]: " choice
+    read -p "请选择 [1/2/3/0]: " choice
 
     local BASE_URL=""
     local TARGET_VER=""
@@ -158,6 +160,10 @@ install_cloudflared() {
             BASE_URL="${GH_PROXY}https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${DOWNLOAD_ARCH}"
             ;;
         2)
+            TARGET_VER="2026.5.0"
+            BASE_URL="${GH_PROXY}https://github.com/cloudflare/cloudflared/releases/download/${TARGET_VER}/cloudflared-linux-${DOWNLOAD_ARCH}"
+            ;;
+        3)
             echo ""
             read -p "请输入要安装的完整版本号 (例如 2024.4.1): " TARGET_VER
             if [[ -z "$TARGET_VER" ]]; then
