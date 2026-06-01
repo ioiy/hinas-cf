@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # ==============================================================================
-# Cloudflared 隧道管理脚本 (V5.0 - 终极全能完整版)
-# 功能：自动架构检测、配置管理、安全备份、UI美化、资源监控
-# V5.0修正：修复备份管理器无法识别 .tar.gz 压缩包的问题
+# Cloudflared 隧道管理脚本 (V5.1 - 终极全能完整版)
+# 功能：自动架构检测、配置管理、安全备份、UI美化、资源监控、备份管理
+# V5.1变更：新增手动指定版本号功能，支持降级或安装特定历史版本
 # ==============================================================================
 
 # --- 全局变量与配置 ---
@@ -102,7 +102,7 @@ check_dependencies() {
 
 install_cloudflared() {
     print_logo
-    echo -e "${CYAN}=== Cloudflared 更新/安装 ===${PLAIN}"
+    echo -e "${CYAN}=== Cloudflared 更新/安装/降级 ===${PLAIN}"
     echo -e "正在检测系统架构..."
     
     local ARCH=$(uname -m)
@@ -137,45 +137,81 @@ install_cloudflared() {
 
     echo ""
     echo -e "----------------------------------------"
-    echo -e "当前版本: ${YELLOW}$LOCAL_VER${PLAIN}"
-    echo -e "最新版本: ${GREEN}$REMOTE_VER${PLAIN}"
+    echo -e "当前已装版本: ${YELLOW}$LOCAL_VER${PLAIN}"
+    echo -e "官方最新版本: ${GREEN}$REMOTE_VER${PLAIN}"
     echo -e "----------------------------------------"
     echo ""
 
-    if [[ "$LOCAL_VER" == "$REMOTE_VER" && "$LOCAL_VER" != "未安装" ]]; then
-        echo -e "${GREEN}当前已是最新版本。${PLAIN}"
-        echo -e "1. 强制重新安装"
-    else
-        echo -e "1. 立即更新/安装"
-    fi
+    echo -e "1. 安装/更新到 ${GREEN}最新版本${PLAIN} ($REMOTE_VER)"
+    echo -e "2. ${YELLOW}手动指定版本号${PLAIN} (用于降级或安装特定历史版本)"
     echo -e "0. 返回上一级"
     echo ""
     
-    read -p "请选择 [1/0]: " choice
+    read -p "请选择 [1/2/0]: " choice
 
-    if [[ "$choice" != "1" ]]; then
-        msg_info "操作已取消。"
-        pause
-        return
+    local BASE_URL=""
+    local TARGET_VER=""
+
+    case $choice in
+        1)
+            TARGET_VER="最新版"
+            BASE_URL="${GH_PROXY}https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${DOWNLOAD_ARCH}"
+            ;;
+        2)
+            echo ""
+            read -p "请输入要安装的完整版本号 (例如 2024.4.1): " TARGET_VER
+            if [[ -z "$TARGET_VER" ]]; then
+                msg_error "版本号不能为空。"
+                pause
+                return
+            fi
+            # 对于指定版本，URL 格式有所不同
+            BASE_URL="${GH_PROXY}https://github.com/cloudflare/cloudflared/releases/download/${TARGET_VER}/cloudflared-linux-${DOWNLOAD_ARCH}"
+            ;;
+        0)
+            return
+            ;;
+        *)
+            msg_error "操作已取消。"
+            pause
+            return
+            ;;
+    esac
+
+    echo ""
+    msg_info "准备下载版本: ${YELLOW}${TARGET_VER}${PLAIN}"
+    
+    # 下载前先停止服务，避免文件占用被拒绝覆盖
+    if systemctl is-active --quiet cloudflared; then
+        msg_info "正在暂时停止 cloudflared 服务以进行替换..."
+        systemctl stop cloudflared
     fi
 
-    local BASE_URL="${GH_PROXY}https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${DOWNLOAD_ARCH}"
-    
-    msg_info "开始下载: cloudflared-linux-${DOWNLOAD_ARCH}"
-    wget --no-check-certificate -O /usr/bin/cloudflared "$BASE_URL"
+    wget --no-check-certificate -O /tmp/cloudflared_new "$BASE_URL"
 
     if [ $? -ne 0 ]; then
-        msg_error "下载失败，请检查网络或更换代理设置。"
-        rm -f /usr/bin/cloudflared
+        msg_error "下载失败！请检查您输入的版本号是否正确，或检查网络连接。"
+        rm -f /tmp/cloudflared_new
+        # 恢复服务
+        systemctl start cloudflared 2>/dev/null
         pause
         return
     fi
 
+    # 替换文件
+    mv /tmp/cloudflared_new /usr/bin/cloudflared
     chmod 0755 /usr/bin/cloudflared
     mkdir -p $CONFIG_DIR
     
-    msg_success "安装/更新完成！"
+    msg_success "安装/替换完成！"
     cloudflared --version
+    
+    # 尝试重启服务
+    if systemctl is-enabled --quiet cloudflared 2>/dev/null; then
+        msg_info "正在重新启动系统服务..."
+        systemctl start cloudflared
+    fi
+    
     pause
 }
 
@@ -529,14 +565,12 @@ backup_config() {
     pause
 }
 
-# --- 修正点：让管理功能识别 /root/ 下的 .tar.gz 文件 ---
 manage_backups() {
     while true; do
         print_logo
         echo -e "${CYAN}=== 备份文件管理 ===${PLAIN}"
         echo -e "${YELLOW}说明：管理位于 /root/ 下的 .tar.gz 压缩备份包${PLAIN}"
         
-        # 扫描 /root/ 下的备份文件
         local backups=($(ls /root/cloudflared_backup_*.tar.gz 2>/dev/null | sort))
         
         if [ ${#backups[@]} -eq 0 ]; then
@@ -866,7 +900,7 @@ check_dependencies
 
 while true; do
     print_logo
-    echo -e "1. ${GREEN}安装 / 更新 Cloudflared${PLAIN} ${YELLOW}(含版本检测)${PLAIN}"
+    echo -e "1. ${GREEN}安装 / 更新 / 降级 Cloudflared${PLAIN} ${YELLOW}(含版本检测)${PLAIN}"
     echo -e "2. ${GREEN}登录 Cloudflare 账户${PLAIN}"
     echo -e "3. ${GREEN}创建新隧道 (本机向导)${PLAIN}"
     echo -e "4. ${CYAN}管理域名 (添加/删除 本地路由)${PLAIN} ${RED}[常用]${PLAIN}"
