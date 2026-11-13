@@ -111,7 +111,6 @@ check_cf() {
  fi
  return 0
 }
-install_cloudflared() {
 
 # 重启并验证
 restart_cf() {
@@ -122,8 +121,36 @@ restart_cf() {
  else
  msg_error "服务重启后未正常运行！请检查日志 (菜单 8 → 1)。"
  systemctl status cloudflared --no-pager 2>/dev/null | head -10
+ 
+ # 隧道实际连接状态
+ if [ -f "$CONFIG_FILE" ]; then
+ local TUNNEL_UUID=$(grep "^tunnel:" "$CONFIG_FILE" | awk "{print $2}")
+ if [ -n "$TUNNEL_UUID" ]; then
+ echo -e "${BLUE}--- 隧道连接信息 ---${PLAIN}"
+ cloudflared tunnel info "$TUNNEL_UUID" 2>/dev/null || msg_warn "无法获取隧道信息"
+ echo ""
+ fi
+ fi
  fi
 }
+install_cloudflared() {
+
+# 验证 config.yml 语法，失败则回滚备份
+validate_config() {
+ if cloudflared tunnel ingress validate --config "$CONFIG_FILE" 2>/dev/null; then
+ return 0
+ else
+ msg_error "配置验证失败！正在回滚备份..."
+ if [ -f "${CONFIG_FILE}.bak" ]; then
+ mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
+ msg_info "已恢复到修改前的配置。"
+ else
+ msg_warn "未找到备份文件，请手动检查 $CONFIG_FILE"
+ fi
+ return 1
+ fi
+}
+
  print_logo
  echo -e "${CYAN}=== Cloudflared 更新/安装/降级 ===${PLAIN}"
  echo -e "正在检测系统架构..."
@@ -259,6 +286,9 @@ restart_cf() {
  fi
  
  msg_success "安装/替换完成！"
+ # 创建快捷命令 cf
+ ln -sf "$0" /usr/bin/cf 2>/dev/null
+ msg_info "快捷命令: 任意目录输入 ${GREEN}cf${PLAIN} 即可打开本脚本"
  /usr/bin/cloudflared --version
  # 尝试重启服务
  if systemctl is-enabled --quiet cloudflared 2>/dev/null; then
@@ -353,6 +383,14 @@ EOL
  cloudflared tunnel route dns "$TUNNEL_NAME" "$HOSTNAME"
  msg_info "正在安装并启动系统服务..."
  cloudflared service install 2>/dev/null
+ # 清理 crontab 定时任务
+ if crontab -l 2>/dev/null | grep -q "cloudflared"; then
+ crontab -l 2>/dev/null | grep -v "cloudflared" | crontab -
+ msg_info "已清理 crontab 中的 cloudflared 定时任务"
+ fi
+ 
+ # 删除快捷命令
+ rm -f /usr/bin/cf
  systemctl daemon-reload
  systemctl enable cloudflared
  systemctl restart cloudflared
@@ -363,11 +401,23 @@ EOL
  else
  msg_error "服务启动失败，请检查日志。"
  systemctl status cloudflared --no-pager
+ 
+ # 隧道实际连接状态
+ if [ -f "$CONFIG_FILE" ]; then
+ local TUNNEL_UUID=$(grep "^tunnel:" "$CONFIG_FILE" | awk "{print $2}")
+ if [ -n "$TUNNEL_UUID" ]; then
+ echo -e "${BLUE}--- 隧道连接信息 ---${PLAIN}"
+ cloudflared tunnel info "$TUNNEL_UUID" 2>/dev/null || msg_warn "无法获取隧道信息"
+ echo ""
+ fi
+ fi
  fi
  pause
 }
 
 # --- 配置文件解析与操作 ---
+
+add_domain_logic() {
 
 list_local_domains() {
  echo -e "${CYAN}--- 当前配置的域名列表 ($CONFIG_FILE) ---${PLAIN}"
@@ -380,48 +430,38 @@ list_local_domains() {
  return
  fi
  
- # 纯 awk 解析 YAML ingress 段
+ # 纯 awk 解析 YAML ingress 段 — 健壮版
  awk '
+ BEGIN { in_ingress=0; host=""; svc="" }
  /^ingress:/ { in_ingress=1; next }
- in_ingress && /- hostname:/ { host=$NF; next }
+ in_ingress && /^[[:space:]]*-/ {
+  # 新条目开始，先输出上一个
+  if (host != "" && svc != "" && svc !~ /http_status:404/) {
+   printf "%s|%s\n", host, svc
+  }
+  host=""; svc=""
+ }
+ in_ingress && /hostname:/ {
+  val=$0; sub(/.*hostname:[[:space:]]*/, "", val); gsub(/\r/, "", val); gsub(/["'"'"']/, "", val)
+  host=val
+ }
  in_ingress && /service:/ {
- svc=$0; sub(/.*service:[[:space:]]*/, "", svc);
- if (svc !~ /http_status:404/) {
- printf "%s|%s\n", host, svc
+  val=$0; sub(/.*service:[[:space:]]*/, "", val); gsub(/\r/, "", val)
+  svc=val
  }
- host=""
+ END {
+  if (host != "" && svc != "" && svc !~ /http_status:404/) {
+   printf "%s|%s\n", host, svc
+  }
  }
- ' "$CONFIG_FILE" | while IFS="|" read -r host svc; do
- if [ -n "$host" ] && [ -n "$svc" ]; then
- printf "${GREEN}%-35s${PLAIN} | ${YELLOW}%-30s${PLAIN}\n" "$host" "$svc"
+ ' "$CONFIG_FILE" | while IFS="|" read -r h s; do
+ if [ -n "$h" ] && [ -n "$s" ]; then
+ printf "${GREEN}%-35s${PLAIN} | ${YELLOW}%-30s${PLAIN}\n" "$h" "$s"
  fi
  done
  
  echo "-------------------------------------------------------------------"
 }
-manage_domains() {
- while true; do
- print_logo
- check_cf || return
- echo -e "${CYAN}=== 域名与路由管理 ===${PLAIN}"
- list_local_domains
- echo ""
- echo "1. 添加新域名"
- echo "2. 删除域名"
- echo "0. 返回主菜单"
- echo ""
- read -p "请选择: " dom_choice
-
- case $dom_choice in
- 1) add_domain_logic ;;
- 2) delete_domain_logic ;;
- 0) return ;;
- *) msg_error "无效输入"; sleep 1 ;;
- esac
- done
-}
-
-add_domain_logic() {
  if [ ! -f "$CONFIG_FILE" ]; then
  msg_error "找不到配置文件，请先创建隧道。"
  pause; return
@@ -435,6 +475,10 @@ add_domain_logic() {
 
  echo ""
  read -p "请输入新域名 (例如: plex.example.com): " NEW_HOST
+ if grep -q "hostname: $NEW_HOST" "$CONFIG_FILE"; then
+ msg_error "域名 $NEW_HOST 已存在，请勿重复添加。"
+ pause; return
+ fi
  read -p "请输入本地端口或地址 (例如 32400 或 http://192.168.1.5:80): " SVC_IN
 
  local NEW_SVC="$SVC_IN"
@@ -471,13 +515,97 @@ add_domain_logic() {
 
  if [ $? -eq 0 ]; then
  msg_success "配置已更新。"
+ msg_info "正在验证配置语法..."
+ if validate_config; then
  msg_info "正在添加 Cloudflare DNS 记录..."
  cloudflared tunnel route dns "$TUNNEL_UUID" "$NEW_HOST"
  msg_info "重启服务以应用更改..."
  restart_cf
+ fi
  else
  msg_error "修改配置文件失败，已恢复备份。"
  mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
+ fi
+ sleep 2
+}
+
+add_domain_batch() {
+ if [ ! -f "$CONFIG_FILE" ]; then
+ msg_error "找不到配置文件，请先创建隧道。"
+ pause; return
+ fi
+
+ local TUNNEL_UUID=$(grep "^tunnel:" "$CONFIG_FILE" | awk "{print $2}")
+ if [ -z "$TUNNEL_UUID" ]; then
+ msg_error "配置文件中无法读取 Tunnel UUID。"
+ pause; return
+ fi
+
+ echo ""
+ echo -e "${CYAN}批量添加域名${PLAIN}"
+ echo "每行一个，格式: 域名 端口或地址"
+ echo "例如:"
+ echo "  plex.example.com 32400"
+ echo "  nas.example.com 5000"
+ echo "  git.example.com http://192.168.1.5:3000"
+ echo "输入空行结束:"
+ echo ""
+
+ local lines=()
+ while IFS= read -r line; do
+ [ -z "$line" ] && break
+ lines+=("$line")
+ done
+
+ if [ ${#lines[@]} -eq 0 ]; then
+ msg_info "未输入任何域名。"
+ pause; return
+ fi
+
+ cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+ local success=0 fail=0
+
+ for line in "${lines[@]}"; do
+ local host=$(echo "$line" | awk "{print $1}")
+ local svc_in=$(echo "$line" | awk "{print $2}")
+
+ if [ -z "$host" ] || [ -z "$svc_in" ]; then
+ msg_error "跳过无效行: $line"
+ fail=$((fail+1))
+ continue
+ fi
+
+ if grep -q "hostname: $host" "$CONFIG_FILE"; then
+ msg_error "跳过已存在: $host"
+ fail=$((fail+1))
+ continue
+ fi
+
+ local new_svc="$svc_in"
+ if [[ "$svc_in" =~ ^[0-9]+$ ]]; then
+ new_svc="http://127.0.0.1:$svc_in"
+ fi
+
+ local insert_str=" - hostname: $host\n service: $new_svc"
+ if grep -q "http_status:404" "$CONFIG_FILE"; then
+ sed -i "/- service: http_status:404/i $insert_str" "$CONFIG_FILE"
+ else
+ echo -e "$insert_str" >> "$CONFIG_FILE"
+ echo " - service: http_status:404" >> "$CONFIG_FILE"
+ fi
+
+ cloudflared tunnel route dns "$TUNNEL_UUID" "$host" 2>/dev/null
+ msg_success "已添加: $host -> $new_svc"
+ success=$((success+1))
+ done
+
+ echo ""
+ echo -e "成功: ${GREEN}$success${PLAIN}  失败: ${RED}$fail${PLAIN}"
+
+ msg_info "正在验证配置语法..."
+ if validate_config; then
+ msg_info "重启服务..."
+ restart_cf
  fi
  sleep 2
 }
@@ -502,9 +630,12 @@ delete_domain_logic() {
  ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
 
  msg_success "已从本地配置移除。"
+ msg_info "正在验证配置语法..."
+ if validate_config; then
  msg_warn "注意：DNS 记录并未删除 (通常无需删除，它只会变无效)。"
  msg_info "重启服务..."
  restart_cf
+ fi
  sleep 2
 }
 
@@ -515,6 +646,16 @@ service_status() {
  # 资源监控已在 Logo 下方显示
  
  systemctl status cloudflared --no-pager
+ 
+ # 隧道实际连接状态
+ if [ -f "$CONFIG_FILE" ]; then
+ local TUNNEL_UUID=$(grep "^tunnel:" "$CONFIG_FILE" | awk "{print $2}")
+ if [ -n "$TUNNEL_UUID" ]; then
+ echo -e "${BLUE}--- 隧道连接信息 ---${PLAIN}"
+ cloudflared tunnel info "$TUNNEL_UUID" 2>/dev/null || msg_warn "无法获取隧道信息"
+ echo ""
+ fi
+ fi
  echo ""
  echo -e "${BLUE}操作选项:${PLAIN}"
  echo "1. 启动服务"
@@ -527,7 +668,7 @@ service_status() {
  case $svc_opt in
  1) systemctl start cloudflared && msg_success "已启动";;
  2) systemctl stop cloudflared && msg_warn "已停止";;
- 3) systemctl restart cloudflared && msg_success "已重启";;
+ 3) restart_cf ;;
  4) systemctl enable cloudflared && msg_success "已设置开机自启";;
  0) return ;;
  *) return ;;
@@ -693,17 +834,17 @@ switch_protocol() {
  if grep -q "protocol: http2" "$CONFIG_FILE"; then
  msg_info "已经是 http2 协议了。"
  else
- sed -i '/^credentials-file:/a protocol: http2' "$CONFIG_FILE"
+ sed -i "/^credentials-file:/a protocol: http2" "$CONFIG_FILE"
  msg_success "已设置为 http2。"
  restart_cf
  fi
  ;;
  2)
  if grep -q "protocol: http2" "$CONFIG_FILE"; then
- sed -i '/protocol: http2/d' "$CONFIG_FILE"
+ sed -i "/protocol: http2/d" "$CONFIG_FILE"
  msg_success "已恢复为 QUIC。"
- systemctl restart cloudflared
  restart_cf
+ else
  msg_info "已经是 QUIC 协议了。"
  fi
  ;;
@@ -711,7 +852,6 @@ switch_protocol() {
  esac
  pause
 }
-
 network_test() {
  print_logo
  echo -e "${CYAN}=== 网络延迟检测 ===${PLAIN}"
@@ -780,8 +920,9 @@ install_token_mode() {
 # --- 定时任务管理 ---
 
 manage_cron() {
+ while true; do
  print_logo
- echo -e "${CYAN}=== 定时重启任务 (Crontab) ===${PLAIN}"
+ echo -e "${CYAN}=== 定时任务管理 (Crontab) ===${PLAIN}"
  
  if ! command -v crontab &> /dev/null; then
  msg_error "系统中未找到 crontab 命令，无法管理定时任务。"
@@ -789,30 +930,70 @@ manage_cron() {
  fi
  
  local CRON_CMD="systemctl restart cloudflared"
+ local WATCH_CMD="systemctl is-active --quiet cloudflared || systemctl start cloudflared"
  local EXISTS=$(crontab -l 2>/dev/null | grep "$CRON_CMD")
+ local WATCH_EXISTS=$(crontab -l 2>/dev/null | grep -F "is-active --quiet cloudflared")
  local CRON_HOUR="4"
  if [ -n "$EXISTS" ]; then
  CRON_HOUR=$(echo "$EXISTS" | awk "{print $2}")
  fi
  
+ # 定时重启状态
  if [ -n "$EXISTS" ]; then
- echo -e "当前状态: ${GREEN}已开启${PLAIN} (每天凌晨 ${CRON_HOUR}:00 重启)"
- echo ""
- echo "1. 关闭定时重启"
- echo "2. 修改重启时间 (当前: ${CRON_HOUR}点)"
+ echo -e "定时重启: ${GREEN}● 已开启${PLAIN} (每天 ${CRON_HOUR}:00)"
  else
- echo -e "当前状态: ${YELLOW}未开启${PLAIN}"
- echo ""
- echo "1. 开启定时重启"
+ echo -e "定时重启: ${YELLOW}○ 未开启${PLAIN}"
  fi
- echo "0. 返回主菜单"
  
+ # 自动恢复状态
+ if [ -n "$WATCH_EXISTS" ]; then
+ echo -e "故障恢复: ${GREEN}● 已开启${PLAIN} (每 5 分钟检测)"
+ else
+ echo -e "故障恢复: ${YELLOW}○ 未开启${PLAIN}"
+ fi
+ 
+ echo ""
+ echo -e "${GREEN}1.${PLAIN} 定时重启 (开启/关闭/改时间)"
+ echo -e "${GREEN}2.${PLAIN} 自动故障恢复 (挂了自动拉起)"
+ echo "0. 返回主菜单"
+ echo ""
  read -p "请选择: " c_choice
  
- if [[ "$c_choice" == "1" ]]; then
+ case $c_choice in
+ 1) manage_cron_restart "$CRON_CMD" "$EXISTS" "$CRON_HOUR" ;;
+ 2) manage_cron_watchdog "$WATCH_CMD" "$WATCH_EXISTS" ;;
+ 0) return ;;
+ *) msg_error "无效选项"; sleep 1 ;;
+ esac
+ done
+}
+
+manage_cron_restart() {
+ local CRON_CMD="$1" EXISTS="$2" CRON_HOUR="$3"
+ 
  if [ -n "$EXISTS" ]; then
+ echo ""
+ echo -e "当前: ${GREEN}已开启${PLAIN} (每天凌晨 ${CRON_HOUR}:00 重启)"
+ echo "1. 关闭定时重启"
+ echo "2. 修改重启时间"
+ echo "0. 返回"
+ read -p "请选择: " sub
+ case $sub in
+ 1)
  crontab -l 2>/dev/null | grep -v "$CRON_CMD" | crontab -
  msg_success "已关闭定时重启。"
+ ;;
+ 2)
+ read -p "请输入新的重启时间 (小时 0-23): " input_hour
+ if ! [[ "$input_hour" =~ ^[0-9]+$ ]] || [ "$input_hour" -lt 0 ] || [ "$input_hour" -gt 23 ]; then
+ msg_error "无效时间"
+ else
+ crontab -l 2>/dev/null | grep -v "$CRON_CMD" | crontab -
+ (crontab -l 2>/dev/null; echo "0 $input_hour * * * $CRON_CMD") | crontab -
+ msg_success "已修改为每天凌晨 ${input_hour}:00 重启"
+ fi
+ ;;
+ esac
  else
  read -p "请输入重启时间 (小时 0-23, 默认4): " input_hour
  CRON_HOUR="${input_hour:-4}"
@@ -823,19 +1004,31 @@ manage_cron() {
  (crontab -l 2>/dev/null; echo "0 $CRON_HOUR * * * $CRON_CMD") | crontab -
  msg_success "已开启定时重启 (每天凌晨 ${CRON_HOUR}:00)"
  fi
- elif [[ "$c_choice" == "2" ]] && [ -n "$EXISTS" ]; then
- read -p "请输入新的重启时间 (小时 0-23): " input_hour
- if ! [[ "$input_hour" =~ ^[0-9]+$ ]] || [ "$input_hour" -lt 0 ] || [ "$input_hour" -gt 23 ]; then
- msg_error "无效时间"
- else
- crontab -l 2>/dev/null | grep -v "$CRON_CMD" | crontab -
- (crontab -l 2>/dev/null; echo "0 $input_hour * * * $CRON_CMD") | crontab -
- msg_success "已修改为每天凌晨 ${input_hour}:00 重启"
- fi
- fi
- pause
+ sleep 2
 }
 
+manage_cron_watchdog() {
+ local WATCH_CMD="$1" WATCH_EXISTS="$2"
+ 
+ if [ -n "$WATCH_EXISTS" ]; then
+ echo ""
+ echo -e "当前: ${GREEN}已开启${PLAIN} (每 5 分钟检测，挂了自动拉起)"
+ read -p "是否关闭自动故障恢复? (y/N): " confirm
+ if [[ "$confirm" =~ ^[yY]$ ]]; then
+ crontab -l 2>/dev/null | grep -v -F "is-active --quiet cloudflared" | crontab -
+ msg_success "已关闭自动故障恢复。"
+ fi
+ else
+ echo ""
+ echo "开启后，每 5 分钟检测 cloudflared 服务状态，如果挂了自动拉起。"
+ read -p "是否开启? (y/N): " confirm
+ if [[ "$confirm" =~ ^[yY]$ ]]; then
+ (crontab -l 2>/dev/null; echo "*/5 * * * * $WATCH_CMD") | crontab -
+ msg_success "已开启自动故障恢复。"
+ fi
+ fi
+ sleep 2
+}
 uninstall_cloudflared() {
  print_logo
  echo -e "${RED}========================================${PLAIN}"
@@ -845,6 +1038,8 @@ uninstall_cloudflared() {
  echo -e "3. 删除 /etc/cloudflared 配置目录"
  echo -e "4. 删除 /root/.cloudflared 凭证目录"
  echo -e "5. 删除 systemd 服务文件"
+ echo -e "6. 清理定时任务 (crontab)"
+ echo -e "7. 删除快捷命令 cf"
  echo ""
  echo -e "${YELLOW}请务必确认您已备份重要数据！${PLAIN}"
  echo ""
@@ -867,6 +1062,14 @@ uninstall_cloudflared() {
  rm -f /etc/systemd/system/cloudflared.service
  rm -f /usr/lib/systemd/system/cloudflared.service
  
+ # 清理 crontab 定时任务
+ if crontab -l 2>/dev/null | grep -q "cloudflared"; then
+ crontab -l 2>/dev/null | grep -v "cloudflared" | crontab -
+ msg_info "已清理 crontab 中的 cloudflared 定时任务"
+ fi
+ 
+ # 删除快捷命令
+ rm -f /usr/bin/cf
  systemctl daemon-reload
  
  msg_success "Cloudflared 已从系统中彻底移除。"
