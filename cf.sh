@@ -417,7 +417,30 @@ EOL
 
 # --- 配置文件解析与操作 ---
 
-add_domain_logic() {
+
+manage_domains() {
+ while true; do
+ print_logo
+ check_cf || return
+ echo -e "${CYAN}=== 域名与路由管理 ===${PLAIN}"
+ list_local_domains
+ echo ""
+ echo "1. 添加新域名"
+ echo "2. 批量添加域名"
+ echo "3. 删除域名"
+ echo "0. 返回主菜单"
+ echo ""
+ read -p "请选择: " dom_choice
+
+ case $dom_choice in
+ 1) add_domain_logic ;;
+ 2) add_domain_batch ;;
+ 3) delete_domain_logic ;;
+ 0) return ;;
+ *) msg_error "无效输入"; sleep 1 ;;
+ esac
+ done
+}
 
 list_local_domains() {
  echo -e "${CYAN}--- 当前配置的域名列表 ($CONFIG_FILE) ---${PLAIN}"
@@ -462,6 +485,8 @@ list_local_domains() {
  
  echo "-------------------------------------------------------------------"
 }
+
+add_domain_logic() {
  if [ ! -f "$CONFIG_FILE" ]; then
  msg_error "找不到配置文件，请先创建隧道。"
  pause; return
