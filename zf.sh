@@ -8,7 +8,7 @@ BACKUP_DIR="/etc/socat-v2raya.backups"
 AUDIT_LOG="/var/log/socat-v2raya-audit.log"
 INSTALLED_FLAG="/etc/socat-v2raya.installed"
 MAX_BACKUPS=10
-VERSION="4.1"
+VERSION="4.2"
 SCRIPT_URL="https://raw.githubusercontent.com/ioiy/hinas-cf/main/zf.sh"
 # =========================================
 
