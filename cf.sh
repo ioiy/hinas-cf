@@ -361,9 +361,14 @@ install_cloudflared() {
  fi
  
  msg_success "安装/替换完成！"
- # 创建快捷命令
- ln -sf "$0" "/usr/bin/${CF_CMD}" 2>/dev/null
- msg_info "快捷命令: 任意目录输入 ${GREEN}${CF_CMD}${PLAIN} 即可打开本脚本"
+ # 创建快捷命令 (使用绝对路径，避免临时位置失效)
+ local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
+ if [[ "$script_path" != /tmp/* ]] && [[ "$script_path" != /var/tmp/* ]]; then
+  ln -sf "$script_path" "/usr/bin/${CF_CMD}" 2>/dev/null
+  msg_info "快捷命令: 任意目录输入 ${GREEN}${CF_CMD}${PLAIN} 即可打开本脚本"
+ else
+  msg_warn "脚本位于临时目录 ($script_path)，跳过创建快捷命令。建议将脚本移到 /root/ 或 /usr/local/bin/ 后重新运行。"
+ fi
  "$CF_BIN" --version
  # 尝试重启服务
  if has_systemd && systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
@@ -457,7 +462,26 @@ EOL
  msg_info "正在注册 DNS 记录..."
  cloudflared tunnel route dns "$TUNNEL_NAME" "$HOSTNAME"
  msg_info "正在安装并启动系统服务..."
- cloudflared service install 2>/dev/null
+ if ! cloudflared service install 2>/dev/null; then
+  msg_warn "cloudflared service install 未成功，尝试手动创建 systemd 服务..."
+  if has_systemd; then
+   cat > "$SERVICE_FILE" << EOL2
+[Unit]
+Description=Cloudflared Tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=${CF_BIN} tunnel --config ${CONFIG_FILE} run
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOL2
+   msg_success "已手动创建 systemd 服务文件。"
+  fi
+ fi
  # 清理 crontab 定时任务
  if crontab -l 2>/dev/null | grep -q "cloudflared"; then
  crontab -l 2>/dev/null | grep -v "cloudflared" | crontab -
@@ -466,9 +490,9 @@ EOL
  
  # 删除快捷命令
  rm -f "/usr/bin/${CF_CMD}"
- systemctl daemon-reload
- systemctl enable "$SERVICE_NAME"
- systemctl restart "$SERVICE_NAME"
+ has_systemd && systemctl daemon-reload
+ has_systemd && systemctl enable "$SERVICE_NAME"
+ has_systemd && systemctl restart "$SERVICE_NAME"
 
  if systemctl is-active --quiet "$SERVICE_NAME"; then
  msg_success "服务启动成功！"
@@ -677,7 +701,6 @@ add_domain_batch() {
  new_svc="http://127.0.0.1:$svc_in"
  fi
 
- cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
  local insert_str=" - hostname: $host\n service: $new_svc"
  if grep -q "http_status:404" "$CONFIG_FILE"; then
  sed -i "/- service: http_status:404/i $insert_str" "$CONFIG_FILE"
@@ -899,7 +922,10 @@ restore_config() {
  print_logo
  echo -e "${CYAN}=== 从备份恢复配置 ===${PLAIN}"
  
- local backups=($(ls /root/cloudflared_backup_*.tar.gz 2>/dev/null | sort))
+ local backups=()
+ while IFS= read -r line; do
+  [ -n "$line" ] && backups+=("$line")
+ done < <(ls /root/cloudflared_backup_*.tar.gz 2>/dev/null | sort)
  
  if [ ${#backups[@]} -eq 0 ]; then
  echo ""
@@ -984,7 +1010,10 @@ manage_backups() {
  echo -e "${CYAN}=== 备份文件管理 ===${PLAIN}"
  echo -e "${YELLOW}说明：管理位于 /root/ 下的 .tar.gz 压缩备份包${PLAIN}"
  
- local backups=($(ls /root/cloudflared_backup_*.tar.gz 2>/dev/null | sort))
+ local backups=()
+ while IFS= read -r line; do
+  [ -n "$line" ] && backups+=("$line")
+ done < <(ls /root/cloudflared_backup_*.tar.gz 2>/dev/null | sort)
  
  if [ ${#backups[@]} -eq 0 ]; then
  echo ""
@@ -1187,16 +1216,19 @@ edit_config() {
  
  # 检查是否有变化
  if cmp -s "$CONFIG_FILE" "${CONFIG_FILE}.bak"; then
- msg_info "配置文件未修改。"
- rm -f "${CONFIG_FILE}.bak"
+  msg_info "配置文件未修改。"
+  rm -f "${CONFIG_FILE}.bak"
  else
- msg_info "检测到配置已修改，正在验证语法..."
- if validate_config; then
- msg_success "配置验证通过！正在重启服务..."
- restart_cf
- else
- msg_error "配置验证失败，已自动回滚。"
- fi
+  msg_info "检测到配置已修改，正在验证语法..."
+  if validate_config; then
+   msg_success "配置验证通过！正在重启服务..."
+   rm -f "${CONFIG_FILE}.bak"
+   restart_cf
+  else
+   msg_error "配置验证失败，已从备份回滚。"
+   # validate_config 已经恢复了 .bak，清理它
+   rm -f "${CONFIG_FILE}.bak"
+  fi
  fi
  pause
 }
@@ -1893,18 +1925,17 @@ docker_menu() {
  read -p "请选择: " d_choice
  
  case $d_choice in
- 1) docker_create_config ;;
- 2) docker_create_token ;;
- 3) docker start "$DOCKER_CONTAINER" && msg_success "容器已启动" ;;
- 4) docker stop "$DOCKER_CONTAINER" && msg_warn "容器已停止" ;;
- 5) docker restart "$DOCKER_CONTAINER" && msg_success "容器已重启" ;;
+ 1) docker_create_config; pause ;;
+ 2) docker_create_token; pause ;;
+ 3) docker start "$DOCKER_CONTAINER" 2>/dev/null && msg_success "容器已启动" || msg_error "启动失败"; pause ;;
+ 4) docker stop "$DOCKER_CONTAINER" 2>/dev/null && msg_warn "容器已停止" || msg_error "停止失败"; pause ;;
+ 5) docker restart "$DOCKER_CONTAINER" 2>/dev/null && msg_success "容器已重启" || msg_error "重启失败"; pause ;;
  6) docker logs -f --tail 50 "$DOCKER_CONTAINER" 2>/dev/null || msg_error "容器不存在" ;;
- 7) docker ps -a --filter "name=$DOCKER_CONTAINER" || msg_error "容器不存在" ;;
- 8) docker_delete ;;
+ 7) docker ps -a --filter "name=$DOCKER_CONTAINER" 2>/dev/null || msg_error "容器不存在"; pause ;;
+ 8) docker_delete; pause ;;
  0) return ;;
  *) msg_error "无效选项"; sleep 1 ;;
  esac
- [ "$d_choice" != "6" ] && [ "$d_choice" != "0" ] && pause
  done
 }
 
@@ -2114,7 +2145,7 @@ service_template_menu() {
   "NAS Web|5000"
   "Plex|32400"
   "Jellyfin|8096"
-  "Emby|8096"
+  "Emby (同Jellyfin)|8096"
   "Home Assistant|8123"
   "qBittorrent|8080"
   "Transmission|9091"
@@ -2122,8 +2153,8 @@ service_template_menu() {
   "Gitea|3000"
   "Nextcloud|80"
   "Portainer|9000"
-  "AdGuard Home|3000"
-  "Vaultwarden|80"
+  "AdGuard Home (同Gitea)|3000"
+  "Vaultwarden (同Nginx)|80"
   "Nginx|80"
  )
  local i=1
@@ -2456,12 +2487,24 @@ ipv6_check() {
  echo ""
  # 测试 Cloudflare IPv6 连通性
  echo -e "${CYAN}--- Cloudflare IPv6 连通性测试 ---${PLAIN}"
+ # ping -6/-4 在 BusyBox 可能不支持，做 fallback
+ local ping6_ok=false ping4_ok=false
  if ping -6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
+  ping6_ok=true
+ elif ping -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
+  ping6_ok=true
+ fi
+ if ping -4 -c 2 -W 3 1.1.1.1 >/dev/null 2>&1; then
+  ping4_ok=true
+ elif ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1; then
+  ping4_ok=true
+ fi
+ if [ "$ping6_ok" = true ]; then
   echo -e "Cloudflare IPv6 (2606:4700:4700::1111): ${GREEN}可达${PLAIN}"
  else
   echo -e "Cloudflare IPv6 (2606:4700:4700::1111): ${YELLOW}不可达${PLAIN}"
  fi
- if ping -4 -c 2 -W 3 1.1.1.1 >/dev/null 2>&1; then
+ if [ "$ping4_ok" = true ]; then
   echo -e "Cloudflare IPv4 (1.1.1.1): ${GREEN}可达${PLAIN}"
  else
   echo -e "Cloudflare IPv4 (1.1.1.1): ${YELLOW}不可达${PLAIN}"
@@ -2496,6 +2539,7 @@ uninstall_cloudflared() {
  has_systemd && systemctl disable "$SERVICE_NAME" 2>/dev/null
  
  # 停止并删除额外隧道服务
+ shopt -s nullglob
  for svc_file in /etc/systemd/system/${SERVICE_NAME}-*.service; do
  if [ -f "$svc_file" ]; then
  local svc_name=$(basename "$svc_file" .service)
