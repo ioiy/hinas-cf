@@ -289,8 +289,9 @@ HEADER
         else
             echo "/usr/bin/socat TCP4-LISTEN:${lp},fork,reuseaddr TCP4:${tip}:${tp} &" >> "$START_SCRIPT"
         fi
+        # 同步 iptables 规则 (确保已启用规则都有防火墙放行)
+        add_iptables_rule "$lp" "$proto"
     done < "$CONF_FILE"
-
     if [ "$has_active" = false ]; then
         echo -e "${YELLOW}警告：没有启用的转发规则，服务将以空状态运行。${NC}"
         echo "sleep infinity" >> "$START_SCRIPT"
@@ -501,7 +502,7 @@ show_traffic() {
 
         # 从 iptables INPUT 链获取该端口的统计
         local stats
-        stats=$(iptables -L INPUT -v -n 2>/dev/null | grep -E "dpt:${lp} ")
+        stats=$(iptables -L INPUT -v -n 2>/dev/null | grep -E "dpt:${lp}([^0-9]|$)")
 
         if [[ -n "$stats" ]]; then
             local pkts bytes formatted
