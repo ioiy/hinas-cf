@@ -3,22 +3,126 @@
 # =================配置区域=================
 CONF_FILE="/etc/socat-v2raya.conf"
 SERVICE_FILE="/etc/systemd/system/socat-v2raya.service"
-VERSION="3.6"
+BACKUP_DIR="/etc/socat-v2raya.backups"
+MAX_BACKUPS=10
+VERSION="4.0"
 # =========================================
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+# 颜色定义 (仅在终端输出时启用，避免管道/重定向乱码)
+if [ -t 1 ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    CYAN='\033[0;36m'
+    NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; NC=''
+fi
 
 # 检查 Root 权限
 if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}错误：请使用 sudo 运行此脚本！${NC}"
-  exit 1
+    echo -e "${RED}错误：请使用 sudo 运行此脚本！${NC}"
+    exit 1
 fi
+
+# ==================== 工具函数 ====================
+
+# 端口校验 (1-65535)
+validate_port() {
+    local port=$1
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        return 1
+    fi
+    return 0
+}
+
+# IP 地址校验 (IPv4 / IPv6 / 主机名)
+validate_ip() {
+    local ip=$1
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local IFS='.'
+        read -ra octets <<< "$ip"
+        for octet in "${octets[@]}"; do
+            [ "$octet" -gt 255 ] && return 1
+        done
+        return 0
+    fi
+    [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && return 0
+    [[ "$ip" =~ ^[a-zA-Z0-9._-]+$ ]] && return 0
+    return 1
+}
+
+# 协议校验
+validate_proto() {
+    local proto=$1
+    [[ "${proto^^}" == "TCP" || "${proto^^}" == "UDP" ]] && return 0
+    return 1
+}
+
+# 解析配置行，输出: "disabled|lp|ip|tp|proto"，注释/空行返回空
+parse_rule() {
+    local line="$1"
+    [[ -z "$line" ]] && return 1
+    local re_dis='^#DISABLED '
+    if [[ "$line" =~ ^# ]]; then
+        if [[ ! "$line" =~ $re_dis ]]; then
+            return 1
+        fi
+    fi
+    local disabled="false"
+    local lp ip tp proto
+
+    if [[ "$line" =~ $re_dis ]]; then
+        disabled="true"
+        read -r _ lp ip tp proto <<< "$line"
+    else
+        read -r lp ip tp proto <<< "$line"
+    fi
+
+    proto=${proto:-TCP}
+    echo "${disabled}|${lp}|${ip}|${tp}|${proto}"
+    return 0
+}
+
+# 格式化字节数为人类可读
+format_bytes() {
+    local bytes=${1:-0}
+    if [ "$bytes" -ge 1073741824 ] 2>/dev/null; then
+        awk "BEGIN {printf \"%.2f GB\", $bytes/1073741824}"
+    elif [ "$bytes" -ge 1048576 ] 2>/dev/null; then
+        awk "BEGIN {printf \"%.2f MB\", $bytes/1048576}"
+    elif [ "$bytes" -ge 1024 ] 2>/dev/null; then
+        awk "BEGIN {printf \"%.2f KB\", $bytes/1024}"
+    else
+        echo "${bytes} B"
+    fi
+}
+
+# 添加 iptables 放行规则
+add_iptables_rule() {
+    local port=$1 proto=$2
+    local proto_lower
+    proto_lower=$(echo "$proto" | tr 'A-Z' 'a-z')
+    if command -v iptables &>/dev/null; then
+        iptables -C INPUT -p "$proto_lower" --dport "$port" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT 1 -p "$proto_lower" --dport "$port" -j ACCEPT 2>/dev/null
+    fi
+}
+
+# 删除 iptables 放行规则 (循环删除所有匹配项)
+remove_iptables_rule() {
+    local port=$1 proto=$2
+    local proto_lower
+    proto_lower=$(echo "$proto" | tr 'A-Z' 'a-z')
+    if command -v iptables &>/dev/null; then
+        while iptables -D INPUT -p "$proto_lower" --dport "$port" -j ACCEPT 2>/dev/null; do
+            :
+        done
+    fi
+}
+
+# ==================== 核心功能 ====================
 
 # 0. 环境自检
 check_dependencies() {
@@ -35,13 +139,28 @@ check_dependencies() {
     if [ "$install_needed" = true ]; then
         if command -v apt-get &> /dev/null; then
             apt-get update -y > /dev/null 2>&1
-            apt-get install -y socat curl iproute2 awk > /dev/null 2>&1
+            apt-get install -y socat curl iproute2 gawk > /dev/null 2>&1
+        elif command -v dnf &> /dev/null; then
+            dnf install -y socat curl iproute gawk > /dev/null 2>&1
         elif command -v yum &> /dev/null; then
-            yum install -y socat curl iproute awk > /dev/null 2>&1
+            yum install -y socat curl iproute gawk > /dev/null 2>&1
         fi
-        echo -e "${GREEN}依赖工具安装完成。${NC}"
+
+        # 验证安装结果
+        local install_ok=true
+        for tool in socat curl; do
+            if ! command -v "$tool" &> /dev/null; then
+                install_ok=false
+                echo -e "${RED}错误：$tool 安装失败！${NC}"
+            fi
+        done
+        if [ "$install_ok" = true ]; then
+            echo -e "${GREEN}依赖工具安装完成。${NC}"
+        else
+            echo -e "${RED}依赖安装不完整，部分功能可能不可用。${NC}"
+        fi
     fi
-    
+
     # 初始化配置
     if [ ! -f "$CONF_FILE" ]; then
         echo "30000 127.0.0.1 20172 TCP" > "$CONF_FILE"
@@ -52,25 +171,33 @@ check_dependencies() {
 # 重建服务 (核心逻辑)
 rebuild_service() {
     echo -e "${BLUE}正在重构系统服务...${NC}"
-    
+
+    local has_active=false
     CMD_STR="/bin/bash -c \""
-    
-    while read -r line; do
-        [[ -z "$line" || "$line" =~ ^# ]] && continue
-        # 读取配置：本地端口 目标IP 目标端口 协议(默认TCP)
-        read -r lp tip tp proto <<< "$line"
-        proto=${proto:-TCP} # 默认 TCP
-        
+
+    while IFS= read -r line; do
+        local parsed
+        parsed=$(parse_rule "$line")
+        [[ -z "$parsed" ]] && continue
+
+        IFS='|' read -r disabled lp tip tp proto <<< "$parsed"
+        [[ "$disabled" == "true" ]] && continue
+
+        has_active=true
         if [[ "${proto^^}" == "UDP" ]]; then
-            # UDP 转发命令
             CMD_STR+="/usr/bin/socat UDP4-LISTEN:${lp},fork UDP4:${tip}:${tp} & "
         else
-            # TCP 转发命令
-            CMD_STR+="/usr/bin/socat TCP4-LISTEN:${lp},fork TCP4:${tip}:${tp} & "
+            CMD_STR+="/usr/bin/socat TCP4-LISTEN:${lp},fork,reuseaddr TCP4:${tip}:${tp} & "
         fi
     done < "$CONF_FILE"
-    
-    CMD_STR+="wait -n\""
+
+    if [ "$has_active" = false ]; then
+        echo -e "${YELLOW}警告：没有启用的转发规则，服务将以空状态运行。${NC}"
+        CMD_STR+="true\""
+    else
+        # wait 等待所有子进程，单个 socat 退出不会导致全组重启
+        CMD_STR+="wait\""
+    fi
 
     cat > "$SERVICE_FILE" << EOF
 [Unit]
@@ -79,6 +206,7 @@ After=network.target docker.service
 
 [Service]
 ExecStart=$CMD_STR
+Type=simple
 Restart=always
 RestartSec=5
 User=root
@@ -91,15 +219,15 @@ EOF
     systemctl daemon-reload
     systemctl enable socat-v2raya.service > /dev/null 2>&1
     systemctl restart socat-v2raya.service
-    
+
     if systemctl is-active --quiet socat-v2raya.service; then
         echo -e "${GREEN}服务已重启并正在运行！${NC}"
     else
-        echo -e "${RED}服务启动失败！请使用选项 7 查看日志。${NC}"
+        echo -e "${RED}服务启动失败！请使用选项 9 查看日志。${NC}"
     fi
 }
 
-# 1. 连通性测试 (Option 1)
+# 1. 连通性测试
 check_connectivity() {
     echo -e "\n${BLUE}=== 请选择测试的目标链接 ===${NC}"
     echo "1. Google (测试代理翻墙连通性 - 默认)"
@@ -107,10 +235,10 @@ check_connectivity() {
     echo "3. GitHub (测试开发者服务连接)"
     echo "4. 百度 (测试国内直连延迟)"
     read -p "请输入序号 [1-4, 默认1]: " target_choice
-    
+
     local test_url="https://www.google.com"
     local target_name="Google"
-    
+
     case $target_choice in
         2) test_url="https://1.1.1.1"; target_name="Cloudflare" ;;
         3) test_url="https://github.com"; target_name="GitHub" ;;
@@ -121,41 +249,49 @@ check_connectivity() {
     echo -e "\n${BLUE}=== 代理连通性深度检测 (目标: $target_name) ===${NC}"
     printf "%-10s %-15s %-8s %-20s %-10s\n" "本地端口" "目标端口" "协议" "测试结果" "连接延迟"
     echo "----------------------------------------------------------------------"
-    
-    while read -r line; do
-        [[ -z "$line" || "$line" =~ ^# ]] && continue
-        read -r lp tip tp proto <<< "$line"
-        proto=${proto:-TCP}
+
+    while IFS= read -r line; do
+        local parsed
+        parsed=$(parse_rule "$line")
+        [[ -z "$parsed" ]] && continue
+
+        IFS='|' read -r disabled lp tip tp proto <<< "$parsed"
+
+        if [[ "$disabled" == "true" ]]; then
+            printf "${YELLOW}%-10s${NC} %-15s %-8s ${YELLOW}%-20s${NC} %-10s\n" "$lp" "$tp" "$proto" "跳过 (已禁用)" "N/A"
+            continue
+        fi
 
         if [[ "${proto^^}" == "UDP" ]]; then
             printf "${CYAN}%-10s${NC} %-15s %-8s ${YELLOW}%-20s${NC} %-10s\n" "$lp" "$tp" "UDP" "跳过 (UDP不支持CURL)" "N/A"
             continue
         fi
-        
-        # HTTP 测试并测算延迟
-        local curl_cmd="curl -s -o /dev/null -m 3"
-        
-        # 1. 尝试 HTTP 代理模式测试
-        local res_http=$( $curl_cmd -x http://127.0.0.1:$lp -w "%{http_code} %{time_total}" "$test_url" 2>/dev/null )
+
+        # HTTP 代理模式测试
+        local res_http http_code time_total
+        res_http=$(curl -s -o /dev/null -m 3 -x http://127.0.0.1:$lp -w "%{http_code} %{time_total}" "$test_url" 2>/dev/null)
         read -r http_code time_total <<< "$res_http"
-        
+
         if [[ "$http_code" =~ ^[23] ]]; then
-            local ms=$(awk "BEGIN {print int($time_total * 1000)}")
+            local ms
+            ms=$(awk "BEGIN {print int($time_total * 1000)}")
             printf "${GREEN}%-10s${NC} %-15s %-8s ${GREEN}%-20s${NC} ${GREEN}%-10s${NC}\n" "$lp" "$tp" "TCP" "通 (HTTP代理)" "${ms} ms"
             continue
         fi
 
-        # 2. 尝试 SOCKS5 代理模式测试
-        local res_socks=$( $curl_cmd -x socks5h://127.0.0.1:$lp -w "%{http_code} %{time_total}" "$test_url" 2>/dev/null )
+        # SOCKS5 代理模式测试 (仅 2xx/3xx 视为成功)
+        local res_socks socks_code socks_total
+        res_socks=$(curl -s -o /dev/null -m 3 -x socks5h://127.0.0.1:$lp -w "%{http_code} %{time_total}" "$test_url" 2>/dev/null)
         read -r socks_code socks_total <<< "$res_socks"
-        
-        if [[ "$socks_code" =~ ^[23] || "$socks_code" == "000" && $(awk "BEGIN {print ($socks_total > 0)?1:0}") -eq 1 ]]; then
-            local ms=$(awk "BEGIN {print int($socks_total * 1000)}")
+
+        if [[ "$socks_code" =~ ^[23] ]]; then
+            local ms
+            ms=$(awk "BEGIN {print int($socks_total * 1000)}")
             printf "${GREEN}%-10s${NC} %-15s %-8s ${GREEN}%-20s${NC} ${GREEN}%-10s${NC}\n" "$lp" "$tp" "TCP" "通 (SOCKS5代理)" "${ms} ms"
         else
             printf "${RED}%-10s${NC} %-15s %-8s ${RED}%-20s${NC} ${RED}%-10s${NC}\n" "$lp" "$tp" "TCP" "连接超时 / 失败" "Timeout"
         fi
-        
+
     done < "$CONF_FILE"
     echo ""
     read -n 1 -s -r -p "按任意键返回菜单..."
@@ -164,14 +300,20 @@ check_connectivity() {
 # 2. 查看状态
 show_status() {
     echo -e "\n${BLUE}=== 当前配置规则 ===${NC}"
-    printf "%-4s %-12s %-15s %-10s %-5s\n" "序号" "本地端口" "目标IP" "目标端口" "协议"
-    echo "---------------------------------------------------------"
+    printf "%-4s %-8s %-12s %-15s %-10s %-5s\n" "序号" "状态" "本地端口" "目标IP" "目标端口" "协议"
+    echo "------------------------------------------------------------------"
     local i=1
-    while read -r line; do
-        [[ -z "$line" || "$line" =~ ^# ]] && continue
-        read -r lp tip tp proto <<< "$line"
-        proto=${proto:-TCP}
-        printf "${YELLOW}%-4s${NC} %-12s -> %-15s : %-10s [%s]\n" "$i" "$lp" "$tip" "$tp" "$proto"
+    while IFS= read -r line; do
+        local parsed
+        parsed=$(parse_rule "$line")
+        [[ -z "$parsed" ]] && continue
+
+        IFS='|' read -r disabled lp tip tp proto <<< "$parsed"
+        if [[ "$disabled" == "true" ]]; then
+            printf "${YELLOW}%-4s${NC} ${RED}%-8s${NC} %-12s -> %-15s : %-10s [%s]\n" "$i" "禁用" "$lp" "$tip" "$tp" "$proto"
+        else
+            printf "${YELLOW}%-4s${NC} ${GREEN}%-8s${NC} %-12s -> %-15s : %-10s [%s]\n" "$i" "启用" "$lp" "$tip" "$tp" "$proto"
+        fi
         ((i++))
     done < "$CONF_FILE"
 
@@ -181,33 +323,93 @@ show_status() {
     else
         echo -e "Systemd: ${RED}Failed / Stopped${NC}"
     fi
-    
-    echo -e "\n${BLUE}=== 端口监听状态 (ss -tlnp) ===${NC}"
-    local ports=$(awk '{print $1}' "$CONF_FILE" 2>/dev/null | tr '\n' '|')
+
+    echo -e "\n${BLUE}=== 端口监听状态 ===${NC}"
+    local ports=""
+    while IFS= read -r line; do
+        local parsed
+        parsed=$(parse_rule "$line")
+        [[ -z "$parsed" ]] && continue
+        IFS='|' read -r disabled lp tip tp proto <<< "$parsed"
+        [[ "$disabled" == "true" ]] && continue
+        ports="${ports}${lp}|"
+    done < "$CONF_FILE"
     ports=${ports%|}
+
     if [ -n "$ports" ] && command -v ss &>/dev/null; then
-        ss -tulnp | grep -E "($ports)"
+        ss -tulnp | grep -E "($ports)" || echo "暂未监听到指定端口"
     else
-        echo "暂未监听到指定端口，或配置为空"
+        echo "暂无启用的规则，或 ss 命令不可用"
     fi
     echo ""
     read -n 1 -s -r -p "按任意键返回..."
 }
 
-# 3. 添加端口 (支持 UDP)
+# 3. 流量统计
+show_traffic() {
+    echo -e "\n${BLUE}=== 流量统计 (iptables 计数) ===${NC}"
+
+    if ! command -v iptables &>/dev/null; then
+        echo -e "${RED}错误：iptables 未安装，无法统计流量${NC}"
+        read -n 1 -s -r -p "按任意键返回..."
+        return
+    fi
+
+    printf "%-10s %-8s %-15s %-15s %-20s\n" "本地端口" "协议" "数据包" "流量" "目标"
+    echo "------------------------------------------------------------------------"
+
+    local has_rule=false
+    while IFS= read -r line; do
+        local parsed
+        parsed=$(parse_rule "$line")
+        [[ -z "$parsed" ]] && continue
+
+        IFS='|' read -r disabled lp ip tp proto <<< "$parsed"
+        [[ "$disabled" == "true" ]] && continue
+        has_rule=true
+
+        local proto_lower
+        proto_lower=$(echo "$proto" | tr 'A-Z' 'a-z')
+
+        # 从 iptables INPUT 链获取该端口的统计
+        local stats
+        stats=$(iptables -L INPUT -v -n 2>/dev/null | grep -E "dpt:${lp} ")
+
+        if [[ -n "$stats" ]]; then
+            local pkts bytes formatted
+            pkts=$(echo "$stats" | head -1 | awk '{print $1}')
+            bytes=$(echo "$stats" | head -1 | awk '{print $2}')
+            formatted=$(format_bytes "$bytes")
+            printf "${GREEN}%-10s${NC} %-8s %-15s %-15s %-20s\n" "$lp" "$proto" "$pkts" "$formatted" "${ip}:${tp}"
+        else
+            printf "${YELLOW}%-10s${NC} %-8s %-15s %-15s %-20s\n" "$lp" "$proto" "N/A" "N/A" "${ip}:${tp}"
+        fi
+    done < "$CONF_FILE"
+
+    if [ "$has_rule" = false ]; then
+        echo -e "${YELLOW}当前没有启用的转发规则${NC}"
+    fi
+
+    echo ""
+    read -n 1 -s -r -p "按任意键返回..."
+}
+
+# 4. 添加端口
 add_port() {
     echo -e "\n${GREEN}=== 添加转发规则 ===${NC}"
     read -p "本地监听端口 (如 30002): " l_port
-    if ! [[ "$l_port" =~ ^[0-9]+$ ]]; then echo -e "${RED}错误：无效端口！${NC}"; return; fi
+    if ! validate_port "$l_port"; then
+        echo -e "${RED}错误：无效端口 (1-65535)！${NC}"; return
+    fi
 
-    if grep -q "^$l_port " "$CONF_FILE"; then
+    if grep -qE "(^|#DISABLED )$l_port " "$CONF_FILE"; then
         echo -e "${RED}错误：该端口在配置文件中已存在！${NC}"; return
     fi
 
     # 智能检查系统级端口冲突
     if command -v ss &>/dev/null; then
         if ss -tulnp | grep -q ":$l_port "; then
-            echo -e "${YELLOW}警告：系统端口 $l_port 已被非当前脚本关联的进程占用！${NC}"
+            echo -e "${YELLOW}警告：系统端口 $l_port 已被其他进程占用！${NC}"
             read -p "强行绑定可能会导致 socat 启动失败，是否继续？(y/n) [默认n]: " force_add
             if [[ "$force_add" != "y" ]]; then
                 echo -e "${RED}操作已取消${NC}"
@@ -218,41 +420,51 @@ add_port() {
 
     read -p "目标 IP (回车默认 127.0.0.1): " t_ip
     t_ip=${t_ip:-127.0.0.1}
+    if ! validate_ip "$t_ip"; then
+        echo -e "${RED}错误：无效目标 IP！${NC}"; return
+    fi
 
     read -p "目标端口 (如 20171): " t_port
-    if ! [[ "$t_port" =~ ^[0-9]+$ ]]; then echo -e "${RED}错误：无效目标端口！${NC}"; return; fi
-    
+    if ! validate_port "$t_port"; then
+        echo -e "${RED}错误：无效目标端口 (1-65535)！${NC}"; return
+    fi
+
     read -p "协议 (1.TCP / 2.UDP) [默认1]: " proto_choice
     if [[ "$proto_choice" == "2" ]]; then proto="UDP"; else proto="TCP"; fi
-    
+
     # 写入配置
     echo "$l_port $t_ip $t_port $proto" >> "$CONF_FILE"
     echo -e "${GREEN}已成功添加: $l_port -> $t_ip:$t_port [$proto]${NC}"
-    
-    # 自动放行防火墙 (兼容 iptables)
-    if command -v iptables &>/dev/null; then
-        if [[ "$proto" == "TCP" ]]; then
-            iptables -I INPUT 1 -p tcp --dport "$l_port" -j ACCEPT >/dev/null 2>&1
-        else
-            iptables -I INPUT 1 -p udp --dport "$l_port" -j ACCEPT >/dev/null 2>&1
-        fi
-    fi
-    
+
+    # 自动放行防火墙
+    add_iptables_rule "$l_port" "$proto"
+
     rebuild_service
 }
 
-# 4. 删除端口
+# 5. 删除端口 (按行号精确删除)
 del_port() {
     echo -e "\n${YELLOW}=== 删除规则 ===${NC}"
     local rules=()
+    local line_nums=()
     local i=1
-    while read -r line; do
-        [[ -z "$line" || "$line" =~ ^# ]] && continue
-        rules+=("$line")
-        echo "$i. $line"
+    local line_num=0
+
+    while IFS= read -r line; do
+        ((line_num++))
+        local parsed
+        parsed=$(parse_rule "$line")
+        [[ -z "$parsed" ]] && continue
+
+        rules+=("$parsed")
+        line_nums+=("$line_num")
+        IFS='|' read -r disabled lp ip tp proto <<< "$parsed"
+        local status="启用"
+        [[ "$disabled" == "true" ]] && status="禁用"
+        echo "$i. [$status] $lp -> $ip:$tp [$proto]"
         ((i++))
     done < "$CONF_FILE"
-    
+
     if [ ${#rules[@]} -eq 0 ]; then
         echo -e "${RED}当前无可用规则${NC}"
         read -n 1 -s -r -p "按任意键返回..."
@@ -261,27 +473,48 @@ del_port() {
 
     read -p "输入序号删除 (c 取消): " num
     [[ "$num" == "c" ]] && return
-    
+
     if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt ${#rules[@]} ]; then
         echo -e "${RED}无效序号${NC}"; return
     fi
-    
-    # 基于内容精确定位删除
-    local line_to_del="${rules[$((num-1))]}"
-    sed -i "\|$line_to_del|d" "$CONF_FILE"
-    echo -e "${GREEN}已成功删除规则。${NC}"
+
+    local idx=$((num-1))
+    local target_line="${line_nums[$idx]}"
+    IFS='|' read -r disabled lp ip tp proto <<< "${rules[$idx]}"
+
+    # 按行号精确删除
+    sed -i "${target_line}d" "$CONF_FILE"
+    echo -e "${GREEN}已成功删除规则: $lp -> $ip:$tp [$proto]${NC}"
+
+    # 清理对应的 iptables 规则
+    remove_iptables_rule "$lp" "$proto"
+    echo -e "${GREEN}已清理对应防火墙规则${NC}"
+
     rebuild_service
 }
 
-# 5. 修改端口
+# 6. 修改端口 (按行号精确替换，带输入校验)
 modify_port() {
     echo -e "\n${BLUE}=== 修改规则 ===${NC}"
     local rules=()
+    local line_nums=()
+    local raw_lines=()
     local i=1
-    while read -r line; do
-        [[ -z "$line" || "$line" =~ ^# ]] && continue
-        rules+=("$line")
-        echo "$i. $line"
+    local line_num=0
+
+    while IFS= read -r line; do
+        ((line_num++))
+        local parsed
+        parsed=$(parse_rule "$line")
+        [[ -z "$parsed" ]] && continue
+
+        rules+=("$parsed")
+        line_nums+=("$line_num")
+        raw_lines+=("$line")
+        IFS='|' read -r disabled lp ip tp proto <<< "$parsed"
+        local status="启用"
+        [[ "$disabled" == "true" ]] && status="禁用"
+        echo "$i. [$status] $lp -> $ip:$tp [$proto]"
         ((i++))
     done < "$CONF_FILE"
 
@@ -298,31 +531,123 @@ modify_port() {
         echo -e "${RED}无效序号${NC}"; return
     fi
 
-    read -r o_lp o_ip o_tp o_proto <<< "${rules[$((num-1))]}"
+    local idx=$((num-1))
+    local target_line="${line_nums[$idx]}"
+    IFS='|' read -r o_disabled o_lp o_ip o_tp o_proto <<< "${rules[$idx]}"
     o_proto=${o_proto:-TCP}
 
     echo "修改规则 (直接回车保持原值):"
     read -p "本地端口 [$o_lp]: " n_lp; n_lp=${n_lp:-$o_lp}
-    read -p "目标 IP [$o_ip]: " n_ip; n_ip=${n_ip:-$o_ip}
-    read -p "目标端口 [$o_tp]: " n_tp; n_tp=${n_tp:-$o_tp}
-    read -p "协议 (TCP/UDP) [$o_proto]: " n_proto; n_proto=${n_proto:-$o_proto}
+    if ! validate_port "$n_lp"; then
+        echo -e "${RED}错误：无效端口 (1-65535)！${NC}"; return
+    fi
 
-    local old_rule="${rules[$((num-1))]}"
+    read -p "目标 IP [$o_ip]: " n_ip; n_ip=${n_ip:-$o_ip}
+    if ! validate_ip "$n_ip"; then
+        echo -e "${RED}错误：无效目标 IP！${NC}"; return
+    fi
+
+    read -p "目标端口 [$o_tp]: " n_tp; n_tp=${n_tp:-$o_tp}
+    if ! validate_port "$n_tp"; then
+        echo -e "${RED}错误：无效目标端口 (1-65535)！${NC}"; return
+    fi
+
+    read -p "协议 (TCP/UDP) [$o_proto]: " n_proto; n_proto=${n_proto:-$o_proto}
+    if ! validate_proto "$n_proto"; then
+        echo -e "${RED}错误：协议仅支持 TCP 或 UDP！${NC}"; return
+    fi
+
+    # 构建新行 (保留禁用状态)
     local new_rule="${n_lp} ${n_ip} ${n_tp} ${n_proto^^}"
-    
-    # 替换对应行
-    sed -i "s|$old_rule|$new_rule|g" "$CONF_FILE"
+    if [[ "$o_disabled" == "true" ]]; then
+        new_rule="#DISABLED ${new_rule}"
+    fi
+
+    # 按行号精确替换
+    sed -i "${target_line}c\\${new_rule}" "$CONF_FILE"
     echo -e "${GREEN}规则已成功更新。${NC}"
+
+    # 如果端口或协议变了，更新 iptables 规则
+    if [[ "$n_lp" != "$o_lp" || "${n_proto^^}" != "${o_proto^^}" ]]; then
+        remove_iptables_rule "$o_lp" "$o_proto"
+        if [[ "$o_disabled" != "true" ]]; then
+            add_iptables_rule "$n_lp" "${n_proto^^}"
+        fi
+    fi
+
     rebuild_service
 }
 
-# 7. 实时日志
+# 7. 启用/禁用规则
+toggle_rule() {
+    echo -e "\n${BLUE}=== 启用/禁用规则 ===${NC}"
+    local rules=()
+    local line_nums=()
+    local raw_lines=()
+    local i=1
+    local line_num=0
+
+    while IFS= read -r line; do
+        ((line_num++))
+        local parsed
+        parsed=$(parse_rule "$line")
+        [[ -z "$parsed" ]] && continue
+
+        rules+=("$parsed")
+        line_nums+=("$line_num")
+        raw_lines+=("$line")
+        IFS='|' read -r disabled lp ip tp proto <<< "$parsed"
+        if [[ "$disabled" == "true" ]]; then
+            echo "$i. ${RED}[禁用]${NC} $lp -> $ip:$tp [$proto]"
+        else
+            echo "$i. ${GREEN}[启用]${NC} $lp -> $ip:$tp [$proto]"
+        fi
+        ((i++))
+    done < "$CONF_FILE"
+
+    if [ ${#rules[@]} -eq 0 ]; then
+        echo -e "${RED}当前无可用规则${NC}"
+        read -n 1 -s -r -p "按任意键返回..."
+        return
+    fi
+
+    read -p "输入序号切换启用/禁用 (c 取消): " num
+    [[ "$num" == "c" ]] && return
+
+    if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt ${#rules[@]} ]; then
+        echo -e "${RED}无效序号${NC}"; return
+    fi
+
+    local idx=$((num-1))
+    local target_line="${line_nums[$idx]}"
+    local old_raw="${raw_lines[$idx]}"
+    IFS='|' read -r disabled lp ip tp proto <<< "${rules[$idx]}"
+
+    local new_line
+    if [[ "$disabled" == "true" ]]; then
+        # 当前禁用 → 启用 (去掉 #DISABLED 前缀)
+        new_line="${old_raw/#\#DISABLED /}"
+        sed -i "${target_line}c\\${new_line}" "$CONF_FILE"
+        echo -e "${GREEN}已启用: $lp -> $ip:$tp [$proto]${NC}"
+        add_iptables_rule "$lp" "$proto"
+    else
+        # 当前启用 → 禁用 (加 #DISABLED 前缀)
+        new_line="#DISABLED ${old_raw}"
+        sed -i "${target_line}c\\${new_line}" "$CONF_FILE"
+        echo -e "${YELLOW}已禁用: $lp -> $ip:$tp [$proto]${NC}"
+        remove_iptables_rule "$lp" "$proto"
+    fi
+
+    rebuild_service
+}
+
+# 8. 实时日志
 view_logs() {
     echo -e "\n${BLUE}=== 日志查看模式 ===${NC}"
     echo "1. 查看最近 50 行 (静态)"
     echo "2. 实时监控日志 (动态 - 按 Ctrl+C 退出)"
     read -p "请选择 [1-2]: " log_choice
-    
+
     if [[ "$log_choice" == "2" ]]; then
         echo -e "${GREEN}正在进入实时监控模式...${NC}"
         journalctl -u socat-v2raya.service -f
@@ -332,25 +657,37 @@ view_logs() {
     fi
 }
 
-# 8. 备份与恢复配置
+# 9. 备份与恢复配置
 backup_restore_config() {
-    local backup_dir="/etc/socat-v2raya.backups"
-    mkdir -p "$backup_dir"
+    mkdir -p "$BACKUP_DIR"
 
     echo -e "\n${BLUE}=== 配置备份与恢复 ===${NC}"
     echo "1. 备份当前配置"
     echo "2. 恢复历史备份"
     echo "3. 返回主菜单"
     read -p "请选择 [1-3]: " br_choice
-    
+
     case $br_choice in
         1)
-            local backup_file="${backup_dir}/socat-v2raya_$(date +%Y%m%d_%H%M%S).conf"
+            local backup_file="${BACKUP_DIR}/socat-v2raya_$(date +%Y%m%d_%H%M%S).conf"
             cp "$CONF_FILE" "$backup_file"
             echo -e "${GREEN}备份成功！配置文件已保存至: $backup_file${NC}"
+
+            # 自动清理旧备份，仅保留最近 MAX_BACKUPS 份
+            local backup_count
+            backup_count=$(ls -1 "$BACKUP_DIR"/*.conf 2>/dev/null | wc -l)
+            if [ "$backup_count" -gt "$MAX_BACKUPS" ]; then
+                local to_delete=$((backup_count - MAX_BACKUPS))
+                ls -t "$BACKUP_DIR"/*.conf | tail -n "$to_delete" | xargs rm -f
+                echo -e "${YELLOW}已自动清理 ${to_delete} 个旧备份 (保留最近 ${MAX_BACKUPS} 份)${NC}"
+            fi
             ;;
         2)
-            local backups=($(ls -t "$backup_dir"/*.conf 2>/dev/null))
+            local backups=()
+            while IFS= read -r f; do
+                backups+=("$f")
+            done < <(ls -t "$BACKUP_DIR"/*.conf 2>/dev/null)
+
             if [ ${#backups[@]} -eq 0 ]; then
                 echo -e "${RED}没有找到历史备份文件！${NC}"
             else
@@ -376,43 +713,41 @@ backup_restore_config() {
     read -n 1 -s -r -p "按任意键返回..."
 }
 
-# 9. 在线更新脚本 (一键同步 GitHub 最新版)
+# 10. 在线更新脚本
 update_script() {
     echo -e "\n${BLUE}=== 在线更新脚本 ===${NC}"
     echo -e "当前本地脚本版本: ${GREEN}${VERSION}${NC}"
     echo -e "正在连接 GitHub 获取最新版本信息..."
-    
+
     local raw_url="https://raw.githubusercontent.com/ioiy/hinas-cf/main/zf.sh"
     local temp_file="/tmp/zf_update.sh"
-    
-    # 下载远程脚本临时文件用于提取版本号
+
     if ! curl -s -L -m 10 "$raw_url" -o "$temp_file"; then
-        echo -e "${RED}错误：无法连接到 GitHub，请检查您的网络连接或代理！${NC}"
+        echo -e "${RED}错误：无法连接到 GitHub，请检查网络连接！${NC}"
         rm -f "$temp_file"
         read -n 1 -s -r -p "按任意键返回..."
         return
     fi
-    
-    # 提取远程脚本里的 VERSION 变量定义
-    local remote_version=$(grep -E "^VERSION=" "$temp_file" | head -n 1 | cut -d'"' -f2)
-    
+
+    local remote_version
+    remote_version=$(grep -E "^VERSION=" "$temp_file" | head -n 1 | cut -d'"' -f2)
+
     if [ -z "$remote_version" ]; then
-        echo -e "${YELLOW}警告：远程文件解析版本号失败，远程文件可能非本管理脚本。${NC}"
+        echo -e "${YELLOW}警告：远程文件解析版本号失败。${NC}"
         remote_version="未知"
     fi
-    
+
     echo -e "--------------------------------------"
     echo -e "本地当前版本: ${YELLOW}${VERSION}${NC}"
     echo -e "远程最新版本: ${CYAN}${remote_version}${NC}"
     echo -e "--------------------------------------"
-    
+
     if [[ "$VERSION" == "$remote_version" ]]; then
         echo -e "${GREEN}您当前已经是最新版本，无需更新！${NC}"
     else
         echo -e "${YELLOW}检测到新版本可用！${NC}"
     fi
-    
-    # 第一次确认
+
     read -p "是否确认下载并更新脚本？(y/n) [默认n]: " confirm
     if [[ "$confirm" != "y" ]]; then
         echo -e "${YELLOW}已取消更新。${NC}"
@@ -420,8 +755,7 @@ update_script() {
         read -n 1 -s -r -p "按任意键返回..."
         return
     fi
-    
-    # 第二次确认（输入完整 yes）
+
     read -p "警告：更新会覆盖当前运行脚本！请输入 [yes] 确认覆盖: " double_confirm
     if [[ "$double_confirm" != "yes" ]]; then
         echo -e "${YELLOW}二次确认未通过，已安全取消。${NC}"
@@ -429,54 +763,124 @@ update_script() {
         read -n 1 -s -r -p "按任意键返回..."
         return
     fi
-    
-    # 再次检查临时文件的合法性
+
+    # 校验下载文件合法性
     if grep -q "rebuild_service" "$temp_file" && grep -q "#!/bin/bash" "$temp_file"; then
-        mv "$temp_file" "$0"
+        # 使用 cp 替代 mv，避免覆盖正在执行的脚本时出竞态
+        cp "$temp_file" "$0"
         chmod +x "$0"
-        echo -e "${GREEN}脚本在线更新成功！正在重新载入并运行新版本...${NC}"
+        rm -f "$temp_file"
+        echo -e "${GREEN}脚本在线更新成功！正在重新载入新版本...${NC}"
         sleep 1.5
         exec "$0"
     else
-        echo -e "${RED}错误：下载的脚本文件内容不完整，校验失败，已放弃更新！${NC}"
+        echo -e "${RED}错误：下载的脚本文件校验失败，已放弃更新！${NC}"
         rm -f "$temp_file"
     fi
     read -n 1 -s -r -p "按任意键返回..."
 }
 
-# 主循环
+# 11. 卸载 (停止服务并清理)
+uninstall() {
+    echo -e "\n${RED}=== 卸载端口转发管理 ===${NC}"
+    echo -e "${YELLOW}此操作将执行以下清理：${NC}"
+    echo "  1. 停止并禁用 socat-v2raya 服务"
+    echo "  2. 删除 systemd 服务文件"
+    echo "  3. 清理所有相关 iptables 规则"
+    echo "  4. (可选) 删除配置文件和备份"
+    echo ""
+    echo -e "${RED}警告：此操作不可逆！${NC}"
+    read -p "确认卸载？请输入 [yes] 确认: " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        echo -e "${YELLOW}已取消卸载。${NC}"
+        read -n 1 -s -r -p "按任意键返回..."
+        return
+    fi
+
+    # 1. 停止并禁用服务
+    echo -e "${BLUE}正在停止服务...${NC}"
+    systemctl stop socat-v2raya.service 2>/dev/null
+    systemctl disable socat-v2raya.service 2>/dev/null
+    echo -e "${GREEN}服务已停止并禁用${NC}"
+
+    # 2. 删除服务文件
+    if [ -f "$SERVICE_FILE" ]; then
+        rm -f "$SERVICE_FILE"
+        systemctl daemon-reload
+        echo -e "${GREEN}已删除服务文件: $SERVICE_FILE${NC}"
+    fi
+
+    # 3. 清理 iptables 规则
+    echo -e "${BLUE}正在清理 iptables 规则...${NC}"
+    local iptables_cleaned=0
+    if command -v iptables &>/dev/null && [ -f "$CONF_FILE" ]; then
+        while IFS= read -r line; do
+            local parsed
+            parsed=$(parse_rule "$line")
+            [[ -z "$parsed" ]] && continue
+            IFS='|' read -r disabled lp ip tp proto <<< "$parsed"
+            remove_iptables_rule "$lp" "$proto"
+            ((iptables_cleaned++))
+        done < "$CONF_FILE"
+    fi
+    echo -e "${GREEN}已清理 ${iptables_cleaned} 条 iptables 规则${NC}"
+
+    # 4. 可选删除配置和备份
+    read -p "是否同时删除配置文件和备份？(y/n) [默认n]: " del_config
+    if [[ "$del_config" == "y" ]]; then
+        rm -f "$CONF_FILE"
+        rm -rf "$BACKUP_DIR"
+        echo -e "${GREEN}已删除配置文件和备份目录${NC}"
+    else
+        echo -e "${YELLOW}已保留配置文件: $CONF_FILE${NC}"
+    fi
+
+    echo -e "\n${GREEN}=== 卸载完成 ===${NC}"
+    echo -e "${YELLOW}如需重新使用，请重新运行本脚本即可自动初始化。${NC}"
+    read -n 1 -s -r -p "按任意键退出..."
+    exit 0
+}
+
+# ==================== 主菜单 ====================
 check_dependencies
+
 while true; do
     clear
     echo -e "${BLUE}======================================${NC}"
-    echo -e "    端口转发与代理管理 (v${VERSION} Ultimate)"
+    echo -e " 端口转发与代理管理 (v${VERSION})"
     echo -e "${BLUE}======================================${NC}"
-    echo -e "${GREEN}1. 连通性测试 (支持多目标与延迟测速)${NC}"
-    echo -e "2. 查看系统状态 (Status & ss 监听)"
+    echo -e "${GREEN}1.${NC} 连通性测试 (多目标延迟测速)"
+    echo -e "${GREEN}2.${NC} 查看系统状态 (规则 & 监听)"
+    echo -e "${GREEN}3.${NC} 流量统计 (iptables 计数)"
     echo -e "--------------------------------------"
-    echo -e "3. 添加转发规则 (带端口冲突智能检测)"
-    echo -e "4. 删除转发规则"
-    echo -e "5. 修改转发规则"
+    echo -e "${GREEN}4.${NC} 添加转发规则"
+    echo -e "${GREEN}5.${NC} 删除转发规则"
+    echo -e "${GREEN}6.${NC} 修改转发规则"
+    echo -e "${GREEN}7.${NC} 启用/禁用规则"
     echo -e "--------------------------------------"
-    echo -e "6. 快速重启服务"
-    echo -e "7. 查看运行日志 (支持实时监控)"
-    echo -e "8. 配置备份与恢复"
-    echo -e "9. ${CYAN}一键在线更新脚本 (GitHub)${NC}"
-    echo -e "0. 退出脚本"
+    echo -e "${GREEN}8.${NC} 快速重启服务"
+    echo -e "${GREEN}9.${NC} 查看运行日志"
+    echo -e "${GREEN}10.${NC} 配置备份与恢复"
+    echo -e "${GREEN}11.${NC} ${CYAN}一键在线更新 (GitHub)${NC}"
+    echo -e "${GREEN}12.${NC} ${RED}卸载 (停止服务并清理)${NC}"
+    echo -e "${GREEN}0.${NC} 退出脚本"
     echo -e "${BLUE}======================================${NC}"
     read -p "请输入选项: " choice
 
     case $choice in
         1) check_connectivity ;;
         2) show_status ;;
-        3) add_port ;;
-        4) del_port ;;
-        5) modify_port ;;
-        6) systemctl restart socat-v2raya.service; echo "已发送重启指令"; sleep 1; show_status ;;
-        7) view_logs ;;
-        8) backup_restore_config ;;
-        9) update_script ;;
+        3) show_traffic ;;
+        4) add_port ;;
+        5) del_port ;;
+        6) modify_port ;;
+        7) toggle_rule ;;
+        8) systemctl restart socat-v2raya.service; echo "已发送重启指令"; sleep 1; show_status ;;
+        9) view_logs ;;
+        10) backup_restore_config ;;
+        11) update_script ;;
+        12) uninstall ;;
         0) exit 0 ;;
-        *) echo "无效选项" ;;
+        *) echo "无效选项"; sleep 1 ;;
     esac
 done
