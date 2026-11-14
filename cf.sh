@@ -1,9 +1,11 @@
 #!/bin/bash
 
 # ==============================================================================
-# Cloudflared 隧道管理脚本 (V6.0 - 终极全能完整版)
+# Cloudflared 隧道管理脚本 (V6.1 - 终极全能完整版)
 # 功能：自动架构检测、配置管理、安全备份、UI美化、资源监控、备份管理
 #       多隧道管理、Docker模式、配置导入导出、流量统计、systemd看门狗
+#       一键诊断、服务模板库、隧道迁移、日志轮转、IPv6适配、配置diff预览
+# V6.1变更：修复6个bug + 新增6个功能模块 (诊断/模板/迁移/轮转/IPv6/diff)
 # V6.0变更：修复全部已知bug + 新增8个功能模块
 # V5.2变更：添加针对老旧设备(armv7l等)的 2026.5.0 兼容版本一键降级选项
 # V5.0变更：新增手动指定版本号功能，支持降级或安装特定历史版本
@@ -675,6 +677,7 @@ add_domain_batch() {
  new_svc="http://127.0.0.1:$svc_in"
  fi
 
+ cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
  local insert_str=" - hostname: $host\n service: $new_svc"
  if grep -q "http_status:404" "$CONFIG_FILE"; then
  sed -i "/- service: http_status:404/i $insert_str" "$CONFIG_FILE"
@@ -715,7 +718,7 @@ delete_domain_logic() {
  # 加固版: 用 grep -n 定位 hostname 行号，删除该行和下一行 (service 行)
  local HOST_LINE=$(grep -n "hostname: $DEL_HOST" "$CONFIG_FILE" | head -1 | cut -d: -f1)
  if [ -n "$HOST_LINE" ]; then
- sed -i "${HOST_LINE}d;$((HOST_LINE+1))d" "$CONFIG_FILE"
+ sed -i "${HOST_LINE},$((HOST_LINE+1))d" "$CONFIG_FILE"
  # 如果上面只删了一行 (service 行可能不在紧接的下一行)，再检查
  if grep -q "hostname: $DEL_HOST" "$CONFIG_FILE"; then
  # fallback: 用 awk 删除
@@ -728,6 +731,8 @@ delete_domain_logic() {
  fi
  fi
 
+ # 显示配置变更 diff
+ show_config_diff "${CONFIG_FILE}.bak" "$CONFIG_FILE" || return
  msg_success "已从本地配置移除。"
  msg_info "正在验证配置语法..."
  if validate_config; then
@@ -810,9 +815,13 @@ toolbox_menu() {
  echo "8. 配置导入/导出"
  echo "9. 隧道流量统计"
  echo "10. 设置 systemd 自动重启 (看门狗)"
+ echo "11. 常用服务模板库"
+ echo "12. 隧道迁移助手"
+ echo "13. 日志轮转配置"
+ echo "14. IPv6 环境检测与适配"
  echo "0. 返回主菜单"
  echo ""
- read -p "请选择 [1-10, 0]: " t_choice
+ read -p "请选择 [1-14, 0]: " t_choice
  
  case $t_choice in
  1) view_logs ;;
@@ -825,6 +834,10 @@ toolbox_menu() {
  8) config_import_export ;;
  9) tunnel_stats ;;
  10) systemd_watchdog ;;
+ 11) service_template_menu ;;
+ 12) tunnel_migrate ;;
+ 13) setup_logrotate ;;
+ 14) ipv6_check ;;
  0) return ;;
  *) msg_error "无效选项"; sleep 1 ;;
  esac
@@ -1093,7 +1106,7 @@ network_test() {
  local loss=$(echo "$ping_result" | grep -oE '[0-9.]+% packet loss' | head -1)
  if [ -n "$loss" ]; then
  local loss_num=$(echo "$loss" | grep -oE '[0-9.]+')
- if [ -n "$loss_num" ] && [ $(echo "$loss_num > 0" | bc 2>/dev/null || echo 1) -eq 1 ]; then
+	if [ -n "$loss_num" ] && awk -v n="$loss_num" 'BEGIN{exit !(n>0)}'; then
  echo -e "${YELLOW}⚠ 检测到丢包: $loss${PLAIN}"
  fi
  fi
@@ -1122,8 +1135,9 @@ network_test() {
  local first_host=$(awk '/hostname:/ {print $NF; exit}' "$CONFIG_FILE")
  if [ -n "$first_host" ]; then
  echo "正在测试隧道域名: https://$first_host"
- local http_code=$(curl -L -o /dev/null -s -w "%{http_code}" --connect-timeout 10 --max-time 15 "https://$first_host" 2>/dev/null)
- local time_total=$(curl -L -o /dev/null -s -w "%{time_total}" --connect-timeout 10 --max-time 15 "https://$first_host" 2>/dev/null)
+	local result=$(curl -L -o /dev/null -s -w "%{http_code} %{time_total}" --connect-timeout 10 --max-time 15 "https://$first_host" 2>/dev/null)
+	local http_code=$(echo "$result" | awk '{print $1}')
+	local time_total=$(echo "$result" | awk '{print $2}')
  if [ -n "$http_code" ] && [ "$http_code" != "000" ]; then
  echo -e "结果: ${GREEN}HTTP $http_code — 隧道连通${PLAIN} | 耗时: ${YELLOW}${time_total}s${PLAIN}"
  else
@@ -1443,7 +1457,7 @@ install_token_mode() {
  
  echo ""
  msg_info "正在停止当前服务..."
- systemctl stop "$SERVICE_NAME" 2>/dev/null
+ has_systemd && systemctl stop "$SERVICE_NAME" 2>/dev/null
  
  if [ -f "$CONFIG_FILE" ]; then
  msg_info "备份旧配置文件..."
@@ -1607,6 +1621,7 @@ multi_tunnel_menu() {
  fi
  
  # 额外隧道配置
+	shopt -s nullglob
  for extra_cfg in "$CONFIG_DIR"/tunnel-*.yml; do
  if [ -f "$extra_cfg" ]; then
  local tname=$(basename "$extra_cfg" | sed 's/tunnel-//;s/.yml//')
@@ -1650,6 +1665,7 @@ multi_tunnel_menu() {
  *) msg_error "无效选项"; sleep 1 ;;
  esac
  done
+	shopt -u nullglob
 }
 
 multi_tunnel_create() {
@@ -1657,6 +1673,9 @@ multi_tunnel_create() {
  read -p "请输入新隧道名称 (英文，如 nas2): " t_name
  if [[ -z "$t_name" ]]; then
  msg_error "名称不能为空。"; return
+ fi
+ if ! [[ "$t_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+ msg_error "名称只能包含字母、数字、下划线和连字符。"; return
  fi
  
  local extra_cfg="$CONFIG_DIR/tunnel-${t_name}.yml"
@@ -1951,6 +1970,504 @@ docker_delete() {
  fi
 }
 
+
+# [新功能] 一键诊断报告
+diagnose_all() {
+ print_logo
+ echo -e "${CYAN}=== 一键诊断报告 ===${PLAIN}"
+ echo ""
+ local pass=0 fail=0 warn=0
+ local results=""
+ check_item() {
+  local name="$1" status="$2" detail="${3:-}"
+  case "$status" in
+  pass) results+="✅ ${GREEN}$name${PLAIN}: 通过"; [ -n "$detail" ] && results+=" ($detail)"; results+="\n"; pass=$((pass+1)) ;;
+  fail) results+="❌ ${RED}$name${PLAIN}: 失败"; [ -n "$detail" ] && results+=" — $detail"; results+="\n"; fail=$((fail+1)) ;;
+  warn) results+="⚠️  ${YELLOW}$name${PLAIN}: 警告"; [ -n "$detail" ] && results+=" — $detail"; results+="\n"; warn=$((warn+1)) ;;
+  esac
+ }
+ echo -e "${BLUE}正在逐项检查...${PLAIN}"
+ echo ""
+ # 1. 二进制
+ if command -v cloudflared &>/dev/null; then
+  local ver=$(cloudflared --version 2>/dev/null | awk '{print $3}' | sed 's/,//')
+  check_item "cloudflared 二进制" pass "v$ver"
+ else
+  check_item "cloudflared 二进制" fail "未安装"
+ fi
+ # 2. 配置文件
+ if [ -f "$CONFIG_FILE" ]; then
+  check_item "配置文件存在" pass "$CONFIG_FILE"
+  if command -v cloudflared &>/dev/null; then
+   if cloudflared tunnel ingress validate --config "$CONFIG_FILE" 2>/dev/null; then
+    check_item "配置语法验证" pass
+   else
+    check_item "配置语法验证" fail "ingress 规则有误"
+   fi
+  fi
+  local uuid=$(get_tunnel_uuid)
+  if [ -n "$uuid" ]; then
+   check_item "Tunnel UUID" pass "$uuid"
+   local cred="$CRED_DIR/${uuid}.json"
+   if [ -f "$cred" ]; then
+    check_item "凭证文件" pass
+   else
+    check_item "凭证文件" fail "$cred 不存在"
+   fi
+  else
+   check_item "Tunnel UUID" fail "配置中未找到"
+  fi
+ else
+  check_item "配置文件" fail "不存在"
+ fi
+ # 3. 服务状态
+ if has_systemd; then
+  if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+   check_item "systemd 服务" pass "运行中"
+  else
+   check_item "systemd 服务" fail "未运行"
+  fi
+  if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+   check_item "开机自启" pass
+  else
+   check_item "开机自启" warn "未设置"
+  fi
+ else
+  if pgrep cloudflared >/dev/null; then
+   check_item "cloudflared 进程" pass "PID: $(pgrep cloudflared | head -1)"
+  else
+   check_item "cloudflared 进程" fail "未运行"
+  fi
+ fi
+ # 4. DNS + 隧道连通性
+ if [ -f "$CONFIG_FILE" ]; then
+  local first_host=$(awk '/hostname:/ {print $NF; exit}' "$CONFIG_FILE")
+  if [ -n "$first_host" ]; then
+   if nslookup "$first_host" >/dev/null 2>&1 || host "$first_host" >/dev/null 2>&1; then
+    check_item "DNS 解析 ($first_host)" pass
+   else
+    check_item "DNS 解析 ($first_host)" warn "解析失败"
+   fi
+   local http_code=$(curl -L -o /dev/null -s -w "%{http_code}" --connect-timeout 8 --max-time 12 "https://$first_host" 2>/dev/null)
+   if [ -n "$http_code" ] && [ "$http_code" != "000" ]; then
+    check_item "隧道连通性" pass "HTTP $http_code"
+   else
+    check_item "隧道连通性" fail "不可达"
+   fi
+  fi
+ fi
+ # 5. 本地端口检查
+ if [ -f "$CONFIG_FILE" ]; then
+  local svc_lines=$(awk '/service:.*127\.0\.0\.1/ {print $NF}' "$CONFIG_FILE")
+  for svc_url in $svc_lines; do
+   local port=$(echo "$svc_url" | grep -oE '[0-9]+$')
+   if [ -n "$port" ]; then
+    if curl -s --connect-timeout 2 -I "$svc_url" >/dev/null 2>&1; then
+     check_item "本地端口 $port" pass
+    else
+     check_item "本地端口 $port" warn "无响应"
+    fi
+   fi
+  done
+ fi
+ # 6. Cloudflare 连通性 + IPv6
+ if ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
+  check_item "Cloudflare 连通性" pass
+ else
+  check_item "Cloudflare 连通性" fail "无法 ping 通 1.1.1.1"
+ fi
+ if ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
+  check_item "IPv6 地址" pass "已配置"
+ else
+  check_item "IPv6 地址" warn "未配置"
+ fi
+ # 输出
+ echo -e "${BLUE}========================================${PLAIN}"
+ echo -e "${CYAN}诊断报告${PLAIN}"
+ echo -e "${BLUE}========================================${PLAIN}"
+ echo -e "$results"
+ echo -e "${BLUE}----------------------------------------${PLAIN}"
+ echo -e "总计: ${GREEN}$pass 通过${PLAIN} | ${RED}$fail 失败${PLAIN} | ${YELLOW}$warn 警告${PLAIN}"
+ echo -e "${BLUE}----------------------------------------${PLAIN}"
+ if [ "$fail" -gt 0 ]; then
+  echo -e "${RED}存在失败项，建议逐一排查。${PLAIN}"
+ elif [ "$warn" -gt 0 ]; then
+  echo -e "${YELLOW}存在警告项，建议关注。${PLAIN}"
+ else
+  echo -e "${GREEN}全部检查通过！隧道运行正常。${PLAIN}"
+ fi
+ pause
+}
+
+# [新功能] 常用服务配置模板库
+service_template_menu() {
+ print_logo
+ check_cf || return
+ if [ ! -f "$CONFIG_FILE" ]; then
+  msg_error "配置文件不存在，请先创建隧道。"
+  pause; return
+ fi
+ echo -e "${CYAN}=== 常用服务模板库 ===${PLAIN}"
+ echo "选择常用服务模板，自动填充端口，只需输入域名前缀。"
+ echo ""
+ local templates=(
+  "NAS Web|5000"
+  "Plex|32400"
+  "Jellyfin|8096"
+  "Emby|8096"
+  "Home Assistant|8123"
+  "qBittorrent|8080"
+  "Transmission|9091"
+  "Alist|5244"
+  "Gitea|3000"
+  "Nextcloud|80"
+  "Portainer|9000"
+  "AdGuard Home|3000"
+  "Vaultwarden|80"
+  "Nginx|80"
+ )
+ local i=1
+ for tpl in "${templates[@]}"; do
+  local name=$(echo "$tpl" | cut -d'|' -f1)
+  local port=$(echo "$tpl" | cut -d'|' -f2)
+  printf " %2d. %-20s 端口: %s\n" "$i" "$name" "$port"
+  let i++
+ done
+ echo "  0. 返回上一级"
+ echo ""
+ read -p "请选择服务模板: " tpl_choice
+ if [[ "$tpl_choice" == "0" ]]; then return; fi
+ if ! [[ "$tpl_choice" =~ ^[0-9]+$ ]] || [ "$tpl_choice" -lt 1 ] || [ "$tpl_choice" -gt ${#templates[@]} ]; then
+  msg_error "无效选择"; return
+ fi
+ local idx=$((tpl_choice-1))
+ local selected="${templates[$idx]}"
+ local svc_name=$(echo "$selected" | cut -d'|' -f1)
+ local svc_port=$(echo "$selected" | cut -d'|' -f2)
+ local svc_url="http://127.0.0.1:$svc_port"
+ echo ""
+ echo -e "已选择: ${GREEN}$svc_name${PLAIN} (端口 $svc_port)"
+ read -p "请输入域名前缀 (如 mynas): " prefix
+ if [[ -z "$prefix" ]]; then
+  msg_error "前缀不能为空"; return
+ fi
+ # 从现有配置提取域名后缀
+ local existing_host=$(awk '/hostname:/ {print $NF; exit}' "$CONFIG_FILE" 2>/dev/null)
+ local domain_suffix=""
+ if [ -n "$existing_host" ]; then
+  domain_suffix=$(echo "$existing_host" | sed 's/^[^.]*\.//')
+ fi
+ local full_host=""
+ if [ -n "$domain_suffix" ]; then
+  full_host="${prefix}.${domain_suffix}"
+  read -p "完整域名 (回车使用 $full_host): " input_host
+  [ -n "$input_host" ] && full_host="$input_host"
+ else
+  read -p "请输入完整域名 (如 ${prefix}.example.com): " full_host
+ fi
+ if [[ -z "$full_host" ]]; then
+  msg_error "域名不能为空"; return
+ fi
+ if grep -q "hostname: $full_host" "$CONFIG_FILE" 2>/dev/null; then
+  msg_error "域名 $full_host 已存在。"; return
+ fi
+ echo ""
+ msg_info "将添加: $full_host -> $svc_url"
+ # 健康检查
+ if ! curl -s --connect-timeout 2 -I "$svc_url" >/dev/null 2>&1; then
+  msg_warn "本地端口 $svc_port 无响应，服务可能未启动。"
+  read -p "仍然添加? (y/N): " force
+  [[ ! "$force" =~ ^[yY]$ ]] && return
+ else
+  msg_success "本地服务检测通畅。"
+ fi
+ local TUNNEL_UUID=$(get_tunnel_uuid)
+ if [ -z "$TUNNEL_UUID" ]; then
+  msg_error "无法读取 Tunnel UUID。"; return
+ fi
+ cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+ local INSERT_STR=" - hostname: $full_host\n service: $svc_url"
+ if grep -q "http_status:404" "$CONFIG_FILE"; then
+  sed -i "/- service: http_status:404/i $INSERT_STR" "$CONFIG_FILE"
+ else
+  echo -e "$INSERT_STR" >> "$CONFIG_FILE"
+  echo " - service: http_status:404" >> "$CONFIG_FILE"
+ fi
+ # 显示 diff 预览
+ show_config_diff "${CONFIG_FILE}.bak" "$CONFIG_FILE" || return
+ msg_info "正在验证配置语法..."
+ if validate_config; then
+  msg_info "正在添加 DNS 记录..."
+  cloudflared tunnel route dns "$TUNNEL_UUID" "$full_host" 2>/dev/null
+  msg_info "重启服务..."
+  restart_cf
+  msg_success "已添加: $full_host -> $svc_url"
+ else
+  msg_error "配置验证失败，已回滚。"
+ fi
+ sleep 2
+}
+
+# [新功能] 配置变更 diff 预览
+show_config_diff() {
+ local old_file="$1" new_file="$2"
+ if [ ! -f "$old_file" ] || [ ! -f "$new_file" ]; then
+  return 0
+ fi
+ # 只有有差异才显示
+ if cmp -s "$old_file" "$new_file"; then
+  return 0
+ fi
+ echo ""
+ echo -e "${CYAN}--- 配置变更预览 (diff) ---${PLAIN}"
+ diff "$old_file" "$new_file" 2>/dev/null
+ echo -e "${CYAN}------------------------${PLAIN}"
+ read -p "确认应用此变更? (y/N): " confirm
+ if [[ ! "$confirm" =~ ^[yY]$ ]]; then
+  msg_info "已取消，正在回滚..."
+  cp "$old_file" "$new_file"
+  return 1
+ fi
+ return 0
+}
+
+# [新功能] 隧道迁移助手
+tunnel_migrate() {
+ while true; do
+  print_logo
+  check_cf || return
+  echo -e "${CYAN}=== 隧道迁移助手 ===${PLAIN}"
+  echo "导出当前隧道的完整配置和凭证，在新机器上导入即可接管同一隧道。"
+  echo ""
+  echo "1. 导出迁移包 (配置 + 凭证)"
+  echo "2. 导入迁移包"
+  echo "0. 返回上一级"
+  echo ""
+  read -p "请选择: " mig_choice
+  case $mig_choice in
+  1) tunnel_migrate_export ;;
+  2) tunnel_migrate_import ;;
+  0) return ;;
+  *) msg_error "无效选项"; sleep 1 ;;
+  esac
+ done
+}
+
+tunnel_migrate_export() {
+ if [ ! -f "$CONFIG_FILE" ]; then
+  msg_error "配置文件不存在。"; return
+ fi
+ local uuid=$(get_tunnel_uuid)
+ if [ -z "$uuid" ]; then
+  msg_error "无法读取 Tunnel UUID。"; return
+ fi
+ local cred_file="$CRED_DIR/${uuid}.json"
+ if [ ! -f "$cred_file" ]; then
+  msg_error "凭证文件不存在: $cred_file"; return
+ fi
+ local export_file="/root/cloudflared_migration_$(date +%Y%m%d_%H%M%S).tar.gz"
+ msg_info "正在打包迁移文件..."
+ tar -czf "$export_file" -C / etc/cloudflared/config.yml "root/.cloudflared/${uuid}.json" 2>/dev/null
+ if [ -f "$export_file" ]; then
+  msg_success "迁移包已生成: $export_file"
+  echo ""
+  echo -e "${YELLOW}迁移步骤：${PLAIN}"
+  echo "1. 将 $export_file 传到新机器 (scp 或 U盘)"
+  echo "2. 在新机器安装 cloudflared (菜单 1)"
+  echo "3. 在新机器运行本脚本 → 工具箱 → 隧道迁移 → 导入迁移包"
+  echo "4. 确认新机器隧道正常后，停止旧机器的服务"
+  echo ""
+  echo -e "${RED}注意：同一隧道不能在两台机器同时运行！${PLAIN}"
+  echo -e "迁移包含凭证文件，请妥善保管，勿公开分享。"
+ else
+  msg_error "打包失败。"
+ fi
+ pause
+}
+
+tunnel_migrate_import() {
+ echo ""
+ read -p "请输入迁移包路径: " import_path
+ if [ ! -f "$import_path" ]; then
+  msg_error "文件不存在: $import_path"; return
+ fi
+ msg_warn "导入将覆盖当前配置和凭证！"
+ read -p "确认导入? (y/N): " confirm
+ if [[ ! "$confirm" =~ ^[yY]$ ]]; then return; fi
+ # 安全备份
+ if [ -d "$CONFIG_DIR" ] || [ -d "$CRED_DIR" ]; then
+  local safety="/root/cloudflared_pre_migrate_$(date +%Y%m%d_%H%M%S).tar.gz"
+  tar -czf "$safety" -C / etc/cloudflared root/.cloudflared 2>/dev/null
+  msg_info "当前配置已备份到: $safety"
+ fi
+ has_systemd && systemctl stop "$SERVICE_NAME" 2>/dev/null
+ mkdir -p "$CONFIG_DIR" "$CRED_DIR"
+ tar -xzf "$import_path" -C /
+ if [ -f "$CONFIG_FILE" ]; then
+  msg_success "迁移包已解压。"
+  msg_info "正在验证配置..."
+  if validate_config; then
+   msg_info "正在重启服务..."
+   if has_systemd; then
+    systemctl daemon-reload
+    systemctl restart "$SERVICE_NAME"
+   else
+    nohup cloudflared tunnel --config "$CONFIG_FILE" run &>/dev/null &
+   fi
+   sleep 3
+   if has_systemd && systemctl is-active --quiet "$SERVICE_NAME"; then
+    msg_success "迁移成功！隧道已在新机器上运行。"
+    show_tunnel_info
+   elif pgrep cloudflared >/dev/null; then
+    msg_success "迁移成功！进程已启动。"
+   else
+    msg_error "服务启动失败，请检查日志。"
+   fi
+  fi
+ else
+  msg_error "解压后未找到配置文件。"
+ fi
+ pause
+}
+
+# [新功能] 日志轮转配置
+setup_logrotate() {
+ print_logo
+ echo -e "${CYAN}=== 日志轮转配置 ===${PLAIN}"
+ local LOG_FILE="/var/log/cloudflared.log"
+ local ROTATE_CONF="/etc/logrotate.d/cloudflared"
+ echo "为非 systemd 环境的日志文件设置自动轮转，避免日志占满磁盘。"
+ echo ""
+ if ! command -v logrotate &>/dev/null; then
+  msg_error "未安装 logrotate。请先安装: apt install logrotate 或 yum install logrotate"
+  pause; return
+ fi
+ # 检查当前状态
+ if [ -f "$ROTATE_CONF" ]; then
+  echo -e "当前状态: ${GREEN}已配置${PLAIN}"
+  echo ""
+  echo "1. 查看当前轮转配置"
+  echo "2. 重新配置"
+  echo "3. 删除轮转配置"
+  echo "0. 返回"
+  read -p "请选择: " lr_choice
+  case "$lr_choice" in
+  1) cat "$ROTATE_CONF"; pause; return ;;
+  3) rm -f "$ROTATE_CONF"; msg_success "已删除轮转配置。"; pause; return ;;
+  2) ;; # 继续到下面的配置
+  0) return ;;
+  *) return ;;
+  esac
+ else
+  echo -e "当前状态: ${YELLOW}未配置${PLAIN}"
+ fi
+ echo ""
+ read -p "日志文件路径 (回车使用默认 /var/log/cloudflared.log): " input_log
+ [ -n "$input_log" ] && LOG_FILE="$input_log"
+ # 确保日志文件存在
+ touch "$LOG_FILE" 2>/dev/null
+ cat > "$ROTATE_CONF" << EOF
+$LOG_FILE {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+ msg_success "日志轮转已配置！"
+ echo -e "日志文件: ${GREEN}$LOG_FILE${PLAIN}"
+ echo -e "轮转策略: 每天轮转，保留 7 天，自动压缩"
+ pause
+}
+
+# [新功能] IPv6 环境适配
+ipv6_check() {
+ print_logo
+ check_cf || return
+ echo -e "${CYAN}=== IPv6 环境检测与适配 ===${PLAIN}"
+ echo ""
+ # 检测 IPv6 地址
+ local has_ipv6=false
+ if ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
+  has_ipv6=true
+  echo -e "IPv6 全局地址: ${GREEN}已配置${PLAIN}"
+  ip -6 addr show scope global 2>/dev/null | grep inet6 | awk '{print "  " $2}'
+ else
+  echo -e "IPv6 全局地址: ${YELLOW}未配置${PLAIN}"
+ fi
+ echo ""
+ # 检测 IPv4
+ local has_ipv4=false
+ if ip -4 addr show scope global 2>/dev/null | grep -q inet; then
+  has_ipv4=true
+  echo -e "IPv4 全局地址: ${GREEN}已配置${PLAIN}"
+ else
+  echo -e "IPv4 全局地址: ${YELLOW}未配置${PLAIN}"
+ fi
+ echo ""
+ # 判断环境类型
+ if [ "$has_ipv6" = true ] && [ "$has_ipv4" = false ]; then
+  echo -e "${RED}检测到 IPv6-only 环境！${PLAIN}"
+  echo "cloudflared 默认使用 IPv4 连接 Cloudflare 边缘，在 IPv6-only 环境会连接失败。"
+  echo "需要在配置中添加 edge-ip-version: 6 参数。"
+  echo ""
+  if [ -f "$CONFIG_FILE" ]; then
+   if grep -q "edge-ip-version" "$CONFIG_FILE"; then
+    echo -e "当前配置已包含 edge-ip-version 参数。"
+    grep "edge-ip-version" "$CONFIG_FILE"
+   else
+    read -p "是否自动添加 edge-ip-version: 6 到配置? (y/N): " confirm
+    if [[ "$confirm" =~ ^[yY]$ ]]; then
+     cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+     sed -i "/^credentials-file:/a edge-ip-version: 6" "$CONFIG_FILE"
+     msg_success "已添加 edge-ip-version: 6"
+     msg_info "正在验证并重启..."
+     validate_config && restart_cf
+    fi
+   fi
+  fi
+ elif [ "$has_ipv6" = true ] && [ "$has_ipv4" = true ]; then
+  echo -e "${GREEN}双栈环境 (IPv4 + IPv6)${PLAIN}"
+  echo "cloudflared 默认使用 IPv4，无需特殊处理。"
+  echo ""
+  if [ -f "$CONFIG_FILE" ]; then
+   if grep -q "edge-ip-version" "$CONFIG_FILE"; then
+    echo -e "当前配置包含 edge-ip-version 参数:"
+    grep "edge-ip-version" "$CONFIG_FILE"
+    echo ""
+    read -p "是否移除 edge-ip-version 参数恢复默认? (y/N): " confirm
+    if [[ "$confirm" =~ ^[yY]$ ]]; then
+     cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+     sed -i "/edge-ip-version/d" "$CONFIG_FILE"
+     msg_success "已移除 edge-ip-version"
+     validate_config && restart_cf
+    fi
+   else
+    echo "配置中未设置 edge-ip-version，使用默认 (IPv4)。"
+   fi
+  fi
+ else
+  echo -e "${RED}未检测到任何全局 IP 地址！${PLAIN}"
+  echo "请检查网络配置。"
+ fi
+ echo ""
+ # 测试 Cloudflare IPv6 连通性
+ echo -e "${CYAN}--- Cloudflare IPv6 连通性测试 ---${PLAIN}"
+ if ping -6 -c 2 -W 3 2606:4700:4700::1111 >/dev/null 2>&1; then
+  echo -e "Cloudflare IPv6 (2606:4700:4700::1111): ${GREEN}可达${PLAIN}"
+ else
+  echo -e "Cloudflare IPv6 (2606:4700:4700::1111): ${YELLOW}不可达${PLAIN}"
+ fi
+ if ping -4 -c 2 -W 3 1.1.1.1 >/dev/null 2>&1; then
+  echo -e "Cloudflare IPv4 (1.1.1.1): ${GREEN}可达${PLAIN}"
+ else
+  echo -e "Cloudflare IPv4 (1.1.1.1): ${YELLOW}不可达${PLAIN}"
+ fi
+ pause
+}
 uninstall_cloudflared() {
  print_logo
  echo -e "${RED}========================================${PLAIN}"
@@ -2112,43 +2629,100 @@ update_script() {
 check_root
 check_dependencies
 
+# --- 分组子菜单 ---
+
+install_menu() {
+ while true; do
+  print_logo
+  echo -e "${CYAN}=== 安装与部署 ===${PLAIN}"
+  echo -e "1. 安装 / 更新 / 降级 Cloudflared (含版本检测)"
+  echo -e "2. Token 模式安装 (网页端管理)"
+  echo -e "3. 登录 Cloudflare 账户"
+  echo -e "4. Docker 模式运行"
+  echo -e "0. 返回主菜单"
+  echo ""
+  read -p "请选择 [0-4]: " sub_choice
+  case $sub_choice in
+  1) install_cloudflared ;;
+  2) install_token_mode ;;
+  3) login_cloudflare ;;
+  4) docker_menu ;;
+  0) return ;;
+  *) msg_error "无效选项"; sleep 1 ;;
+  esac
+ done
+}
+
+tunnel_menu() {
+ while true; do
+  print_logo
+  echo -e "${CYAN}=== 隧道与域名管理 ===${PLAIN}"
+  echo -e "1. 创建新隧道 (本机向导)"
+  echo -e "2. ${GREEN}管理域名 (添加/删除 本地路由) [常用]${PLAIN}"
+  echo -e "3. 列出云端所有隧道"
+  echo -e "4. 多隧道管理"
+  echo -e "0. 返回主菜单"
+  echo ""
+  read -p "请选择 [0-4]: " sub_choice
+  case $sub_choice in
+  1) create_tunnel_wizard ;;
+  2) manage_domains ;;
+  3)
+   print_logo
+   cloudflared tunnel list
+   pause
+   ;;
+  4) multi_tunnel_menu ;;
+  0) return ;;
+  *) msg_error "无效选项"; sleep 1 ;;
+  esac
+ done
+}
+
+ops_menu() {
+ while true; do
+  print_logo
+  echo -e "${CYAN}=== 服务运维 ===${PLAIN}"
+  echo -e "1. 服务管理 (启动/停止/日志)"
+  echo -e "2. ${GREEN}一键诊断报告${PLAIN}"
+  echo -e "3. 定时任务与自动保活 (Crontab/Systemd)"
+  echo -e "0. 返回主菜单"
+  echo ""
+  read -p "请选择 [0-3]: " sub_choice
+  case $sub_choice in
+  1) service_status ;;
+  2) diagnose_all ;;
+  3) manage_cron ;;
+  0) return ;;
+  *) msg_error "无效选项"; sleep 1 ;;
+  esac
+ done
+}
+
+# --- 主菜单 ---
+
 while true; do
  print_logo
- echo -e "1. 安装 / 更新 / 降级 Cloudflared (含版本检测)"
- echo -e "2. 登录 Cloudflare 账户"
- echo -e "3. 创建新隧道 (本机向导)"
- echo -e "4. ${GREEN}管理域名 (添加/删除 本地路由) [常用]${PLAIN}"
- echo -e "5. 服务管理 (启动/停止/日志)"
- echo -e "6. 列出云端所有隧道"
- echo -e "7. 更新此脚本"
- echo -e "8. 高级工具箱 (日志/备份/恢复/协议/编辑/导入导出/流量/看门狗)"
- echo -e "9. ${RED}彻底卸载 Cloudflared${PLAIN}"
- echo -e "10. Token 模式安装 (网页端管理)"
- echo -e "11. 定时任务与自动保活 (Crontab/Systemd)"
- echo -e "12. 多隧道管理"
- echo -e "13. Docker 模式运行"
+ echo -e "${CYAN}========== Cloudflared 隧道管理 ==========${PLAIN}"
+ echo ""
+ echo -e "1. ${BLUE}安装与部署${PLAIN}  (安装/Token/登录/Docker)"
+ echo -e "2. ${GREEN}隧道与域名${PLAIN}  (创建/域名管理/列表/多隧道)"
+ echo -e "3. ${BLUE}服务运维${PLAIN}    (启停/诊断/定时保活)"
+ echo -e "4. ${BLUE}高级工具箱${PLAIN}  (日志/备份/模板/迁移/IPv6...)"
+ echo -e "5. 更新此脚本"
+ echo -e "6. ${RED}彻底卸载 Cloudflared${PLAIN}"
  echo -e "0. 退出"
- read -p "请输入选项 [0-13]: " choice
+ echo ""
+ read -p "请输入选项 [0-6]: " choice
 
  case $choice in
- 1) install_cloudflared ;;
- 2) login_cloudflare ;;
- 3) create_tunnel_wizard ;;
- 4) manage_domains ;;
- 5) service_status ;;
- 6) 
- print_logo
- cloudflared tunnel list
- pause
- ;;
- 7) update_script ;;
- 8) toolbox_menu ;;
- 9) uninstall_cloudflared ;;
- 10) install_token_mode ;;
- 11) manage_cron ;;
- 12) multi_tunnel_menu ;;
- 13) docker_menu ;;
- 0) exit 0 ;;
+ 1) install_menu ;;
+ 2) tunnel_menu ;;
+ 3) ops_menu ;;
+ 4) toolbox_menu ;;
+ 5) update_script ;;
+ 6) uninstall_cloudflared ;;
+ 0) echo "退出。"; exit 0 ;;
  *) msg_error "无效选项"; sleep 1 ;;
  esac
 done
